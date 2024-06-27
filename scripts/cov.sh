@@ -31,13 +31,17 @@ mkdir cov
 # to drastically be lowered. In that case, we don't want the code coverage to be
 # uploaded.
 #
-go test -v -covermode=atomic -coverprofile=./cov/conf.out ./conf -timeout=20m -tags=skip_no_race_tests
+go test -v -covermode=atomic -coverprofile=./cov/conf.out ./conf -timeout=1h -tags=skip_no_race_tests
 check_file "conf" "conf.out"
-go test -v -covermode=atomic -coverprofile=./cov/log.out ./logger -timeout=20m -tags=skip_no_race_tests
+go test -v -covermode=atomic -coverprofile=./cov/internal.out ./internal/ldap -timeout=1h -tags=skip_no_race_tests
+check_file "internal" "internal.out"
+go test -v -covermode=atomic -coverprofile=./cov/log.out ./logger -timeout=1h -tags=skip_no_race_tests
 check_file "logger" "log.out"
-go test -v -covermode=atomic -coverprofile=./cov/server.out ./server -timeout=20m -tags=skip_no_race_tests
+go test -v -covermode=atomic -coverprofile=./cov/server_avl.out ./server/avl -timeout=1h -tags=skip_no_race_tests
+check_file "server_avl" "server_avl.out"
+go test -v -covermode=atomic -coverprofile=./cov/server.out ./server -timeout=1h -tags=skip_no_race_tests
 check_file "server" "server.out"
-go test -v -covermode=atomic -coverprofile=./cov/test.out -coverpkg=./server ./test -timeout=20m -tags=skip_no_race_tests
+go test -v -covermode=atomic -coverprofile=./cov/test.out -coverpkg=./server ./test -timeout=1h -tags=skip_no_race_tests
 check_file "test" "test.out"
 
 # At this point, if that fails, we want the caller to know about the failure.

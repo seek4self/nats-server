@@ -18,12 +18,12 @@ package test
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -46,12 +46,13 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 			write_deadline: "2s"
 			cluster {
 				port: -1
+				pool_size: -1
+				compression: disabled
 				%s
 			}
 			no_sys_acc: true
 	`
 	cfa := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer removeFile(t, cfa)
 	srvA, optsA := RunServerWithConfig(cfa)
 	srvA.Shutdown()
 	optsA.DisableShortFirstPing = true
@@ -103,7 +104,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 			"nats://%s:%d"
 		]
 	`, optsA.Cluster.Host, optsA.Cluster.Port)
-	if err := ioutil.WriteFile(cfb, []byte(fmt.Sprintf(template, routes)), 0600); err != nil {
+	if err := os.WriteFile(cfb, []byte(fmt.Sprintf(template, routes)), 0600); err != nil {
 		t.Fatalf("Error rewriting B's config file: %v", err)
 	}
 	if err := srvB.Reload(); err != nil {
@@ -220,7 +221,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	// Otherwise, on test shutdown the client close
 	// will cause the server to try to send unsubs and
 	// this can delay the test.
-	if err := ioutil.WriteFile(cfb, []byte(fmt.Sprintf(template, "")), 0600); err != nil {
+	if err := os.WriteFile(cfb, []byte(fmt.Sprintf(template, "")), 0600); err != nil {
 		t.Fatalf("Error rewriting B's config file: %v", err)
 	}
 	if err := srvB.Reload(); err != nil {
@@ -451,8 +452,10 @@ func TestNoRaceClusterLeaksSubscriptions(t *testing.T) {
 	// Create 100 repliers
 	for i := 0; i < 50; i++ {
 		nc1, _ := nats.Connect(urlA)
+		defer nc1.Close()
 		nc1.SetErrorHandler(noOpErrHandler)
 		nc2, _ := nats.Connect(urlB)
+		defer nc2.Close()
 		nc2.SetErrorHandler(noOpErrHandler)
 		repliers = append(repliers, nc1, nc2)
 		nc1.Subscribe("test.reply", func(m *nats.Msg) {
@@ -684,7 +687,7 @@ func TestNoRaceSlowProxy(t *testing.T) {
 	// Now test send BW.
 	const payloadSize = 64 * 1024
 	var payload [payloadSize]byte
-	rand.Read(payload[:])
+	crand.Read(payload[:])
 
 	// 5MB total.
 	bytesSent := (5 * 1024 * 1024)

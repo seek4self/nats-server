@@ -1,7 +1,7 @@
 project_name: nats-server
 
 builds:
-  - main: ./main.go
+  - main: .
     id: nats-server
     binary: nats-server
     ldflags:
@@ -20,16 +20,16 @@ dockers:
     skip_push: true
     dockerfile: docker/Dockerfile.nightly
     build_flag_templates:
-      - '--build-arg=VERSION=nightly-{{ time "20060102" }}'
+      - '--build-arg=VERSION={{ if index .Env "IMAGE_NAME"  }}{{ .Env.IMAGE_NAME }}{{ else if not (eq .Branch "main" "dev" "") }}{{ replace .Branch "/" "-" }}{{ else }}nightly{{ end }}-{{ time "20060102" }}'
     image_templates:
       - synadia/nats-server:{{.Version}}
-      - synadia/nats-server:nightly
+      - synadia/nats-server:{{ if index .Env "IMAGE_NAME"  }}{{ .Env.IMAGE_NAME }}{{ else if not (eq .Branch "main" "dev" "") }}{{ replace .Branch "/" "-" }}{{ else }}nightly{{ end }}
     extra_files:
       - docker/nats-server.conf
 
 checksum:
-  name_template: 'SHA256SUMS'
+  name_template: "SHA256SUMS"
   algorithm: sha256
 
 snapshot:
-  name_template: 'nightly-{{ time "20060102" }}'
+  name_template: '{{ if index .Env "IMAGE_NAME"  }}{{ .Env.IMAGE_NAME }}{{ else if not (eq .Branch "main" "dev" "") }}{{ replace .Branch "/" "-" }}{{ else }}nightly{{ end }}-{{ time "20060102" }}'

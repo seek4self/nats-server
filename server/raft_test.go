@@ -1,4 +1,4 @@
-// Copyright 2021 The NATS Authors
+// Copyright 2021-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,56 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
 )
+
+func TestNRGSimple(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+	// Do several state transitions.
+	rg.randomMember().(*stateAdder).proposeDelta(11)
+	rg.randomMember().(*stateAdder).proposeDelta(11)
+	rg.randomMember().(*stateAdder).proposeDelta(-22)
+	// Wait for all members to have the correct state.
+	rg.waitOnTotal(t, 0)
+}
+
+func TestNRGSnapshotAndRestart(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	var expectedTotal int64
+
+	leader := rg.leader().(*stateAdder)
+	sm := rg.nonLeader().(*stateAdder)
+
+	for i := 0; i < 1000; i++ {
+		delta := rand.Int63n(222)
+		expectedTotal += delta
+		leader.proposeDelta(delta)
+
+		if i == 250 {
+			// Let some things catchup.
+			time.Sleep(50 * time.Millisecond)
+			// Snapshot leader and stop and snapshot a member.
+			leader.snapshot(t)
+			sm.snapshot(t)
+			sm.stop()
+		}
+	}
+	// Restart.
+	sm.restart()
+	// Wait for all members to have the correct state.
+	rg.waitOnTotal(t, expectedTotal)
+}
 
 func TestNRGAppendEntryEncode(t *testing.T) {
 	ae := &appendEntry{
@@ -90,4 +139,269 @@ func TestNRGAppendEntryDecode(t *testing.T) {
 			require_Error(t, err, errBadAppendEntry)
 		}
 	}
+}
+
+func TestNRGRecoverFromFollowingNoLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	// Find out what term we are on.
+	term := rg.leader().node().Term()
+
+	// Start by pausing all of the nodes. This will stop them from
+	// processing new entries.
+	for _, n := range rg {
+		n.node().PauseApply()
+	}
+
+	// Now drain all of the ApplyQ entries from them, which will stop
+	// them from automatically trying to follow a previous leader if
+	// they happened to have received an apply entry from one. Then
+	// we're going to force them into a state where they are all
+	// followers but they don't have a leader.
+	for _, n := range rg {
+		rn := n.node().(*raft)
+		rn.ApplyQ().drain()
+		rn.switchToFollower("")
+	}
+
+	// Resume the nodes.
+	for _, n := range rg {
+		n.node().ResumeApply()
+	}
+
+	// Wait a while. The nodes should notice that they haven't heard
+	// from a leader lately and will switch to voting. After an
+	// election we should find a new leader and be on a new term.
+	rg.waitOnLeader()
+	require_True(t, rg.leader() != nil)
+	require_NotEqual(t, rg.leader().node().Term(), term)
+}
+
+func TestNRGObserverMode(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	// Put all of the followers into observer mode. In this state
+	// they will not participate in an election but they will continue
+	// to apply incoming commits.
+	for _, n := range rg {
+		if n.node().Leader() {
+			continue
+		}
+		n.node().SetObserver(true)
+	}
+
+	// Propose a change from the leader.
+	adder := rg.leader().(*stateAdder)
+	adder.proposeDelta(1)
+	adder.proposeDelta(2)
+	adder.proposeDelta(3)
+
+	// Wait for the followers to apply it.
+	rg.waitOnTotal(t, 6)
+
+	// Confirm the followers are still just observers and weren't
+	// reset out of that state for some reason.
+	for _, n := range rg {
+		if n.node().Leader() {
+			continue
+		}
+		require_True(t, n.node().IsObserver())
+	}
+}
+
+// TestNRGSimpleElection tests that a simple election succeeds. It is
+// simple because the group hasn't processed any entries and hasn't
+// suffered any interruptions of any kind, therefore there should be
+// no way that the conditions for granting the votes can fail.
+func TestNRGSimpleElection(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 9)
+	defer c.shutdown()
+	c.waitOnLeader()
+
+	nc, _ := jsClientConnect(t, c.leader(), nats.UserInfo("admin", "s3cr3t!"))
+	defer nc.Close()
+
+	rg := c.createRaftGroup("TEST", 9, newStateAdder)
+	rg.waitOnLeader()
+
+	voteReqs := make(chan *nats.Msg, 1)
+	voteResps := make(chan *nats.Msg, len(rg)-1)
+
+	// Keep a record of the term when we started.
+	leader := rg.leader().node().(*raft)
+	startTerm := leader.term
+
+	// Subscribe to the vote request subject, this should be the
+	// same across all nodes in the group.
+	_, err := nc.ChanSubscribe(leader.vsubj, voteReqs)
+	require_NoError(t, err)
+
+	// Subscribe to all of the vote response inboxes for all nodes
+	// in the Raft group, as they can differ.
+	for _, n := range rg {
+		rn := n.node().(*raft)
+		_, err = nc.ChanSubscribe(rn.vreply, voteResps)
+		require_NoError(t, err)
+	}
+
+	// Step down, this will start a new voting session.
+	require_NoError(t, rg.leader().node().StepDown())
+
+	// Wait for a vote request to come in.
+	msg := require_ChanRead(t, voteReqs, time.Second)
+	vr := decodeVoteRequest(msg.Data, msg.Reply)
+	require_True(t, vr != nil)
+	require_NotEqual(t, vr.candidate, "")
+
+	// The leader should have bumped their term in order to start
+	// an election.
+	require_Equal(t, vr.term, startTerm+1)
+	require_Equal(t, vr.lastTerm, startTerm)
+
+	// Wait for all of the vote responses to come in. There should
+	// be as many vote responses as there are followers.
+	for i := 0; i < len(rg)-1; i++ {
+		msg := require_ChanRead(t, voteResps, time.Second)
+		re := decodeVoteResponse(msg.Data)
+		require_True(t, re != nil)
+
+		// The vote should have been granted.
+		require_Equal(t, re.granted, true)
+
+		// The node granted the vote, therefore the term in the vote
+		// response should have advanced as well.
+		require_Equal(t, re.term, vr.term)
+		require_Equal(t, re.term, startTerm+1)
+	}
+
+	// Everyone in the group should have voted for our candidate
+	// and arrived at the term from the vote request.
+	for _, n := range rg {
+		rn := n.node().(*raft)
+		require_Equal(t, rn.term, vr.term)
+		require_Equal(t, rn.term, startTerm+1)
+		require_Equal(t, rn.vote, vr.candidate)
+	}
+}
+
+func TestNRGStepDownOnSameTermDoesntClearVote(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	c.waitOnLeader()
+
+	nc, _ := jsClientConnect(t, c.leader(), nats.UserInfo("admin", "s3cr3t!"))
+	defer nc.Close()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	lsm := rg.leader().(*stateAdder)
+	leader := lsm.node().(*raft)
+	follower := rg.nonLeader().node().(*raft)
+
+	// Make sure we handle the leader change notification from above.
+	require_ChanRead(t, lsm.lch, time.Second)
+
+	// Subscribe to the append entry subject.
+	sub, err := nc.SubscribeSync(leader.asubj)
+	require_NoError(t, err)
+
+	// Get the first append entry that we receive.
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_NoError(t, sub.Unsubscribe())
+
+	// We're going to modify the append entry that we received so that
+	// we can send it again with modifications.
+	ae, err := leader.decodeAppendEntry(msg.Data, nil, msg.Reply)
+	require_NoError(t, err)
+
+	// First of all we're going to try sending an append entry that
+	// has an old term and a fake leader.
+	msg.Reply = follower.areply
+	ae.leader = follower.id
+	ae.term = leader.term - 1
+	msg.Data, err = ae.encode(msg.Data[:0])
+	require_NoError(t, err)
+	require_NoError(t, nc.PublishMsg(msg))
+
+	// Because the term was old, the fake leader shouldn't matter as
+	// the current leader should ignore it.
+	require_NoChanRead(t, lsm.lch, time.Second)
+
+	// Now we're going to send it on the same term that the current leader
+	// is on. What we expect to happen is that the leader will step down
+	// but it *shouldn't* clear the vote.
+	ae.term = leader.term
+	msg.Data, err = ae.encode(msg.Data[:0])
+	require_NoError(t, err)
+	require_NoError(t, nc.PublishMsg(msg))
+
+	// Wait for the leader transition and ensure that the vote wasn't
+	// cleared.
+	require_ChanRead(t, lsm.lch, time.Second)
+	require_NotEqual(t, leader.vote, noVote)
+}
+
+func TestNRGUnsuccessfulVoteRequestDoesntResetElectionTimer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	c.waitOnLeader()
+
+	nc, _ := jsClientConnect(t, c.leader(), nats.UserInfo("admin", "s3cr3t!"))
+	defer nc.Close()
+
+	rg := c.createRaftGroup("TEST", 3, newStateAdder)
+	rg.waitOnLeader()
+	leader := rg.leader().node().(*raft)
+	follower := rg.nonLeader().node().(*raft)
+
+	// Set up a new inbox for the vote responses to go to.
+	vsubj, vreply := leader.vsubj, nc.NewInbox()
+	ch := make(chan *nats.Msg, 3)
+	_, err := nc.ChanSubscribe(vreply, ch)
+	require_NoError(t, err)
+
+	// Keep a track of the last time the election timer was reset before this.
+	// Also build up a vote request that's obviously behind so that the other
+	// nodes should not do anything with it. All locks are taken at the same
+	// time so that it guarantees that both the leader and the follower aren't
+	// operating at the time we take the etlr snapshots.
+	rg.lockAll()
+	leaderOriginal := leader.etlr
+	followerOriginal := follower.etlr
+	vr := &voteRequest{
+		term:      follower.term,
+		lastTerm:  follower.term - 1,
+		lastIndex: 0,
+		candidate: follower.id,
+	}
+	rg.unlockAll()
+
+	// Now send a vote request that's obviously behind.
+	require_NoError(t, nc.PublishMsg(&nats.Msg{
+		Subject: vsubj,
+		Reply:   vreply,
+		Data:    vr.encode(),
+	}))
+
+	// Wait for everyone to respond.
+	require_ChanRead(t, ch, time.Second)
+	require_ChanRead(t, ch, time.Second)
+	require_ChanRead(t, ch, time.Second)
+
+	// Neither the leader nor our chosen follower should have updated their
+	// election timer as a result of this.
+	rg.lockAll()
+	defer rg.unlockAll()
+	require_True(t, leaderOriginal.Equal(leader.etlr))
+	require_True(t, followerOriginal.Equal(follower.etlr))
 }

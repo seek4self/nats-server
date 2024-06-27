@@ -16,8 +16,9 @@ package test
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -450,11 +451,11 @@ func TestMultipleRoutesSameId(t *testing.T) {
 	// We should only receive on one route, not both.
 	// Check both manually.
 	route1.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buf, _ := ioutil.ReadAll(route1)
+	buf, _ := io.ReadAll(route1)
 	route1.SetReadDeadline(time.Time{})
 	if len(buf) <= 0 {
 		route2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buf, _ = ioutil.ReadAll(route2)
+		buf, _ = io.ReadAll(route2)
 		route2.SetReadDeadline(time.Time{})
 		if len(buf) <= 0 {
 			t.Fatal("Expected to get one message on a route, received none.")
@@ -527,8 +528,8 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 
 type ignoreLogger struct{}
 
-func (l *ignoreLogger) Fatalf(f string, args ...interface{}) {}
-func (l *ignoreLogger) Errorf(f string, args ...interface{}) {}
+func (l *ignoreLogger) Fatalf(f string, args ...any) {}
+func (l *ignoreLogger) Errorf(f string, args ...any) {}
 
 func TestRouteConnectOnShutdownRace(t *testing.T) {
 	s, opts := runRouteServer(t)
@@ -1098,13 +1099,12 @@ func TestRouteBasicPermissions(t *testing.T) {
 	}
 }
 
-func createConfFile(t *testing.T, content []byte) string {
+func createConfFile(t testing.TB, content []byte) string {
 	t.Helper()
-	conf := createFile(t, "")
+	conf := createTempFile(t, "")
 	fName := conf.Name()
 	conf.Close()
-	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
-		removeFile(t, fName)
+	if err := os.WriteFile(fName, content, 0666); err != nil {
 		t.Fatalf("Error writing conf file: %v", err)
 	}
 	return fName
@@ -1150,7 +1150,6 @@ func TestRoutesOnlyImportOrExport(t *testing.T) {
 				}
 			}
 		`, c)))
-		defer removeFile(t, cf)
 		s, _ := RunServerWithConfig(cf)
 		s.Shutdown()
 	}

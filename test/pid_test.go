@@ -15,7 +15,6 @@ package test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 )
@@ -23,17 +22,14 @@ import (
 func TestPidFile(t *testing.T) {
 	opts := DefaultTestOptions
 
-	tmpDir := createDir(t, "_nats-server")
-	defer removeDir(t, tmpDir)
-
-	file := createFileAtDir(t, tmpDir, "nats-server:pid_")
+	file := createTempFile(t, "nats-server:pid_")
 	file.Close()
 	opts.PidFile = file.Name()
 
 	s := RunServer(&opts)
 	s.Shutdown()
 
-	buf, err := ioutil.ReadFile(opts.PidFile)
+	buf, err := os.ReadFile(opts.PidFile)
 	if err != nil {
 		t.Fatalf("Could not read pid_file: %v", err)
 	}

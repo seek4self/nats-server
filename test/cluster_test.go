@@ -26,7 +26,7 @@ import (
 )
 
 // Helper function to check that a cluster is formed
-func checkClusterFormed(t *testing.T, servers ...*server.Server) {
+func checkClusterFormed(t testing.TB, servers ...*server.Server) {
 	t.Helper()
 	expectedNumRoutes := len(servers) - 1
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
@@ -74,7 +74,7 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 	return nil
 }
 
-func checkSubInterest(t *testing.T, s *server.Server, accName, subject string, timeout time.Duration) {
+func checkSubInterest(t testing.TB, s *server.Server, accName, subject string, timeout time.Duration) {
 	t.Helper()
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		acc, err := s.LookupAccount(accName)
@@ -240,6 +240,10 @@ func TestClusterQueueSubs(t *testing.T) {
 	sendB("PING\r\n")
 	expectB(pongRe)
 
+	// Give plenty of time for the messages to flush, so that we don't
+	// accidentally only read some of them.
+	time.Sleep(time.Millisecond * 250)
+
 	// Should receive 5.
 	matches = expectMsgsA(5)
 	checkForQueueSid(t, matches, qg1SidsA)
@@ -247,6 +251,10 @@ func TestClusterQueueSubs(t *testing.T) {
 
 	// Send to A
 	sendA("PUB foo 2\r\nok\r\n")
+
+	// Give plenty of time for the messages to flush, so that we don't
+	// accidentally only read some of them.
+	time.Sleep(time.Millisecond * 250)
 
 	// Should receive 5.
 	matches = expectMsgsA(5)
@@ -269,6 +277,10 @@ func TestClusterQueueSubs(t *testing.T) {
 
 	// Send to B
 	sendB("PUB foo 2\r\nok\r\n")
+
+	// Give plenty of time for the messages to flush, so that we don't
+	// accidentally only read some of them.
+	time.Sleep(time.Millisecond * 250)
 
 	// Should receive 1 from B.
 	matches = expectMsgsB(1)
@@ -307,6 +319,10 @@ func TestClusterQueueSubs(t *testing.T) {
 
 	// Send to A
 	sendA("PUB foo 2\r\nok\r\n")
+
+	// Give plenty of time for the messages to flush, so that we don't
+	// accidentally only read some of them.
+	time.Sleep(time.Millisecond * 250)
 
 	// Should receive 4 now.
 	matches = expectMsgsA(4)
@@ -389,6 +405,8 @@ func TestClusterDoubleMsgs(t *testing.T) {
 	sendB("PUB foo 2\r\nok\r\n")
 	sendB("PING\r\n")
 	expectB(pongRe)
+
+	time.Sleep(10 * time.Millisecond)
 
 	matches = expectMsgsA2(2)
 	checkMsg(t, matches[0], "foo", "", "", "2", "ok")
@@ -542,7 +560,6 @@ func TestClusterNameOption(t *testing.T) {
 			listen: 127.0.0.1:-1
 		}
 	`))
-	defer removeFile(t, conf)
 
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -563,7 +580,6 @@ func TestEphemeralClusterName(t *testing.T) {
 			listen: 127.0.0.1:-1
 		}
 	`))
-	defer removeFile(t, conf)
 
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -582,7 +598,7 @@ type captureErrLogger struct {
 	ch chan string
 }
 
-func (c *captureErrLogger) Errorf(format string, v ...interface{}) {
+func (c *captureErrLogger) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	select {
 	case c.ch <- msg:
@@ -600,7 +616,6 @@ func TestClusterNameConflictsDropRoutes(t *testing.T) {
 			listen: 127.0.0.1:5244
 		}
 	`))
-	defer removeFile(t, conf)
 
 	s1, _ := RunServerWithConfig(conf)
 	defer s1.Shutdown()
@@ -614,7 +629,6 @@ func TestClusterNameConflictsDropRoutes(t *testing.T) {
 			routes = [nats-route://127.0.0.1:5244]
 		}
 	`))
-	defer removeFile(t, conf2)
 
 	s2, _ := RunServerWithConfig(conf2)
 	defer s2.Shutdown()
@@ -635,7 +649,6 @@ func TestClusterNameDynamicNegotiation(t *testing.T) {
 		listen: 127.0.0.1:-1
 		cluster {listen: 127.0.0.1:5244}
 	`))
-	defer removeFile(t, conf)
 
 	seed, _ := RunServerWithConfig(conf)
 	defer seed.Shutdown()
@@ -647,7 +660,6 @@ func TestClusterNameDynamicNegotiation(t *testing.T) {
 			routes = [nats-route://127.0.0.1:5244]
 		}
 	`))
-	defer removeFile(t, oconf)
 
 	// Create a random number of additional servers, up to 20.
 	numServers := rand.Intn(20) + 1

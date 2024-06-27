@@ -298,7 +298,7 @@ func TestConfigCheck(t *testing.T) {
 		  hello = "world"
 		}
 		`,
-			err:       errors.New(`error parsing tls config, unknown field ["hello"]`),
+			err:       errors.New(`error parsing tls config, unknown field "hello"`),
 			errorLine: 3,
 			errorPos:  5,
 		},
@@ -311,7 +311,7 @@ func TestConfigCheck(t *testing.T) {
 		  }
 		}
 		`,
-			err:       errors.New(`error parsing tls config, unknown field ["foo"]`),
+			err:       errors.New(`error parsing tls config, unknown field "foo"`),
 			errorLine: 4,
 			errorPos:  7,
 		},
@@ -326,7 +326,7 @@ func TestConfigCheck(t *testing.T) {
 		    preferences = []
 		}
 		`,
-			err:       errors.New(`error parsing tls config, unknown field ["preferences"]`),
+			err:       errors.New(`error parsing tls config, unknown field "preferences"`),
 			errorLine: 7,
 			errorPos:  7,
 		},
@@ -342,7 +342,7 @@ func TestConfigCheck(t *testing.T) {
 		    suites = []
 		}
 		`,
-			err:       errors.New(`error parsing tls config, unknown field ["suites"]`),
+			err:       errors.New(`error parsing tls config, unknown field "suites"`),
 			errorLine: 8,
 			errorPos:  7,
 		},
@@ -1579,6 +1579,372 @@ func TestConfigCheck(t *testing.T) {
 			errorLine: 5,
 			errorPos:  6,
 		},
+		{
+			name: "wrong type for cluster pool size",
+			config: `
+				cluster {
+					port: -1
+					pool_size: "abc"
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is string, not int64"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "wrong type for cluster accounts",
+			config: `
+				cluster {
+					port: -1
+					accounts: 123
+				}
+			`,
+			err:       fmt.Errorf("error parsing accounts: unsupported type int64"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "wrong type for cluster compression",
+			config: `
+				cluster {
+					port: -1
+					compression: 123
+				}
+			`,
+			err:       fmt.Errorf("field %q should be a boolean or a structure, got int64", "compression"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "wrong type for cluster compression mode",
+			config: `
+				cluster {
+					port: -1
+					compression: {
+						mode: 123
+					}
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not string"),
+			errorLine: 5,
+			errorPos:  7,
+		},
+		{
+			name: "wrong type for cluster compression rtt thresholds",
+			config: `
+				cluster {
+					port: -1
+					compression: {
+						mode: "s2_auto"
+						rtt_thresholds: 123
+					}
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not []interface {}"),
+			errorLine: 6,
+			errorPos:  7,
+		},
+		{
+			name: "invalid durations for cluster compression rtt thresholds",
+			config: `
+				cluster {
+					port: -1
+					compression: {
+						mode: "s2_auto"
+						rtt_thresholds: [abc]
+					}
+				}
+			`,
+			err:       fmt.Errorf("time: invalid duration %q", "abc"),
+			errorLine: 6,
+			errorPos:  7,
+		},
+		{
+			name: "invalid durations for cluster ping interval",
+			config: `
+				cluster {
+					port: -1
+					ping_interval: -1
+					ping_max: 6
+				}
+			`,
+			err:       fmt.Errorf(`invalid use of field "ping_interval": ping_interval should be converted to a duration`),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "invalid durations for cluster ping interval",
+			config: `
+				cluster {
+					port: -1
+					ping_interval: '2m'
+					ping_max: 6
+				}
+			`,
+			warningErr: fmt.Errorf(`Cluster 'ping_interval' will reset to 30s which is the max for routes`),
+			errorLine:  4,
+			errorPos:   6,
+		},
+		{
+			name: "wrong type for leafnodes compression",
+			config: `
+				leafnodes {
+					port: -1
+					compression: 123
+				}
+			`,
+			err:       fmt.Errorf("field %q should be a boolean or a structure, got int64", "compression"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "wrong type for leafnodes compression mode",
+			config: `
+				leafnodes {
+					port: -1
+					compression: {
+						mode: 123
+					}
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not string"),
+			errorLine: 5,
+			errorPos:  7,
+		},
+		{
+			name: "wrong type for leafnodes compression rtt thresholds",
+			config: `
+				leafnodes {
+					port: -1
+					compression: {
+						mode: "s2_auto"
+						rtt_thresholds: 123
+					}
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not []interface {}"),
+			errorLine: 6,
+			errorPos:  7,
+		},
+		{
+			name: "invalid durations for leafnodes compression rtt thresholds",
+			config: `
+				leafnodes {
+					port: -1
+					compression: {
+						mode: "s2_auto"
+						rtt_thresholds: [abc]
+					}
+				}
+			`,
+			err:       fmt.Errorf("time: invalid duration %q", "abc"),
+			errorLine: 6,
+			errorPos:  7,
+		},
+		{
+			name: "wrong type for remote leafnodes compression",
+			config: `
+				leafnodes {
+					port: -1
+					remotes [
+						{
+							url: "nats://127.0.0.1:123"
+							compression: 123
+						}
+					]
+				}
+			`,
+			err:       fmt.Errorf("field %q should be a boolean or a structure, got int64", "compression"),
+			errorLine: 7,
+			errorPos:  8,
+		},
+		{
+			name: "wrong type for remote leafnodes compression mode",
+			config: `
+				leafnodes {
+					port: -1
+					remotes [
+						{
+							url: "nats://127.0.0.1:123"
+							compression: {
+								mode: 123
+							}
+						}
+					]
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not string"),
+			errorLine: 8,
+			errorPos:  9,
+		},
+		{
+			name: "wrong type for remote leafnodes compression rtt thresholds",
+			config: `
+				leafnodes {
+					port: -1
+					remotes [
+						{
+							url: "nats://127.0.0.1:123"
+							compression: {
+								mode: "s2_auto"
+								rtt_thresholds: 123
+							}
+						}
+					]
+				}
+			`,
+			err:       fmt.Errorf("interface conversion: interface {} is int64, not []interface {}"),
+			errorLine: 9,
+			errorPos:  9,
+		},
+		{
+			name: "invalid durations for remote leafnodes compression rtt thresholds",
+			config: `
+				leafnodes {
+					port: -1
+					remotes [
+						{
+							url: "nats://127.0.0.1:123"
+							compression: {
+								mode: "s2_auto"
+								rtt_thresholds: [abc]
+							}
+						}
+					]
+				}
+			`,
+			err:       fmt.Errorf("time: invalid duration %q", "abc"),
+			errorLine: 9,
+			errorPos:  9,
+		},
+		{
+			name:       "show warnings on empty configs without values",
+			config:     ``,
+			warningErr: errors.New(`config has no values or is empty`),
+			errorLine:  0,
+			errorPos:   0,
+			reason:     "",
+		},
+		{
+			name: "show warnings on empty configs without values and only comments",
+			config: `# Valid file but has no usable values.
+                                    `,
+			warningErr: errors.New(`config has no values or is empty`),
+			errorLine:  0,
+			errorPos:   0,
+			reason:     "",
+		},
+		{
+			name: "TLS handshake first, wrong type",
+			config: `
+				port: -1
+				tls {
+					first: 123
+				}
+			`,
+			err:       fmt.Errorf("field %q should be a boolean or a string, got int64", "first"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "TLS handshake first, wrong value",
+			config: `
+				port: -1
+				tls {
+					first: "123"
+				}
+			`,
+			err:       fmt.Errorf("field %q's value %q is invalid", "first", "123"),
+			errorLine: 4,
+			errorPos:  6,
+		},
+		{
+			name: "TLS multiple certs",
+			config: `
+				port: -1
+				tls {
+					certs: [
+					  { cert_file: "configs/certs/server.pem", key_file: "configs/certs/key.pem"},
+					  { cert_file: "configs/certs/cert.new.pem", key_file: "configs/certs/key.new.pem"},
+					]
+				}
+			`,
+			err: nil,
+		},
+		{
+			name: "TLS multiple certs, bad type",
+			config: `
+				port: -1
+				tls {
+					certs: [
+					  { cert_file: "configs/certs/server.pem", key_file: 123 },
+					  { cert_file: "configs/certs/cert.new.pem", key_file: "configs/certs/key.new.pem"},
+					]
+				}
+			`,
+			err:       fmt.Errorf("error parsing certificates config: unsupported type int64"),
+			errorLine: 5,
+			errorPos:  49,
+		},
+		{
+			name: "TLS multiple certs, missing key_file",
+			config: `
+				port: -1
+				tls {
+					certs: [
+					  { cert_file: "configs/certs/server.pem" }
+					  { cert_file: "configs/certs/cert.new.pem", key_file: "configs/certs/key.new.pem"}
+					]
+				}
+			`,
+			err:       fmt.Errorf("error parsing certificates config: both 'cert_file' and 'cert_key' options are required"),
+			errorLine: 5,
+			errorPos:  10,
+		},
+		{
+			name: "TLS multiple certs and single cert options at the same time",
+			config: `
+				port: -1
+				tls {
+					cert_file: "configs/certs/server.pem"
+					key_file: "configs/certs/key.pem"
+					certs: [
+					  { cert_file: "configs/certs/server.pem", key_file: "configs/certs/key.pem"},
+					  { cert_file: "configs/certs/cert.new.pem", key_file: "configs/certs/key.new.pem"},
+					]
+				}
+			`,
+			err:       fmt.Errorf("error parsing tls config, cannot combine 'cert_file' option with 'certs' option"),
+			errorLine: 3,
+			errorPos:  5,
+		},
+		{
+			name: "TLS multiple certs used but not configured, but cert_file configured",
+			config: `
+				port: -1
+				tls {
+					cert_file: "configs/certs/server.pem"
+					key_file: "configs/certs/key.pem"
+					certs: []
+				}
+			`,
+			err: nil,
+		},
+		{
+			name: "TLS multiple certs, missing bad path",
+			config: `
+				port: -1
+				tls {
+					certs: [
+					  { cert_file: "configs/certs/cert.new.pem", key_file: "configs/certs/key.new.pem"}
+					  { cert_file: "configs/certs/server.pem", key_file: "configs/certs/key.new.pom" }
+					]
+				}
+			`,
+			err:       fmt.Errorf("error parsing X509 certificate/key pair 2/2: open configs/certs/key.new.pom: no such file or directory"),
+			errorLine: 3,
+			errorPos:  5,
+		},
 	}
 
 	checkConfig := func(config string) error {
@@ -1602,7 +1968,6 @@ func TestConfigCheck(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, []byte(test.config))
-			defer removeFile(t, conf)
 			err := checkConfig(conf)
 			var expectedErr error
 
@@ -1621,6 +1986,8 @@ func TestConfigCheck(t *testing.T) {
 					if test.reason != "" {
 						msg += ": " + test.reason
 					}
+				} else if test.warningErr != nil {
+					msg = expectedErr.Error()
 				} else {
 					msg = test.reason
 				}

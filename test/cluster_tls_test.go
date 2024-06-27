@@ -15,7 +15,7 @@ package test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +72,7 @@ type captureTLSError struct {
 	ch chan struct{}
 }
 
-func (c *captureTLSError) Errorf(format string, v ...interface{}) {
+func (c *captureTLSError) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "handshake error") {
 		select {
@@ -87,7 +87,7 @@ type captureClusterTLSInsecureLogger struct {
 	ch chan struct{}
 }
 
-func (c *captureClusterTLSInsecureLogger) Warnf(format string, v ...interface{}) {
+func (c *captureClusterTLSInsecureLogger) Warnf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "solicited routes will not be verified") {
 		select {
@@ -103,6 +103,8 @@ func TestClusterTLSInsecure(t *testing.T) {
 		cluster {
 			name: "xyz"
 			listen: "127.0.0.1:-1"
+			pool_size: -1
+			compression: "disabled"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
 				key_file:  "./configs/certs/server-key-noip.pem"
@@ -122,6 +124,8 @@ func TestClusterTLSInsecure(t *testing.T) {
 		cluster {
 			name: "xyz"
 			listen: "127.0.0.1:-1"
+			pool_size: -1
+			compression: "disabled"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
 				key_file:  "./configs/certs/server-key-noip.pem"
@@ -151,7 +155,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	srvB.SetLogger(wl, false, false)
 
 	// Need to add "insecure: true" and reload
-	if err := ioutil.WriteFile(confB,
+	if err := os.WriteFile(confB,
 		[]byte(fmt.Sprintf(bConfigTemplate, "insecure: true", optsA.Cluster.Host, optsA.Cluster.Port)),
 		0666); err != nil {
 		t.Fatalf("Error rewriting file: %v", err)

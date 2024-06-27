@@ -15,29 +15,31 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v1
+        uses: actions/checkout@v4
         with:
           path: src/github.com/nats-io/nats-server
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.17.x
+          go-version: "1.21.x"
 
       - name: Run code coverage
         shell: bash --noprofile --norc -x -eo pipefail {0}
         run: |
           set -e
+          cd src/github.com/nats-io/nats-server
           ./scripts/cov.sh upload
           set +e
 
       - name: Convert coverage.out to coverage.lcov
-        uses: jandelgado/gcov2lcov-action@v1.0.8
+        uses: jandelgado/gcov2lcov-action@v1.0.9
         with:
           infile: acc.out
+          working-directory: src/github.com/nats-io/nats-server
 
       - name: Coveralls
-        uses: coverallsapp/github-action@1.1.3
+        uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.github_token }}
-          path-to-lcov: coverage.lcov
+          file: src/github.com/nats-io/nats-server/coverage.lcov

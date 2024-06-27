@@ -234,7 +234,6 @@ func TestMixedClientConfig(t *testing.T) {
         {user: alice, password: foo}
       ]
     }`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error processing config file: %v", err)
@@ -275,7 +274,7 @@ func BenchmarkNonceGeneration(b *testing.B) {
 func BenchmarkPublicVerify(b *testing.B) {
 	data := make([]byte, nonceRawLen)
 	nonce := make([]byte, nonceLen)
-	mrand.Read(data)
+	crand.Read(data)
 	base64.RawURLEncoding.Encode(nonce, data)
 
 	user, err := nkeys.CreateUser()

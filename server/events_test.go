@@ -1,4 +1,4 @@
-// Copyright 2018-2020 The NATS Authors
+// Copyright 2018-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,11 +15,15 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +33,7 @@ import (
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+	"github.com/nats-io/nuid"
 )
 
 func createAccount(s *Server) (*Account, nkeys.KeyPair) {
@@ -45,11 +50,10 @@ func createAccount(s *Server) (*Account, nkeys.KeyPair) {
 	return acc, akp
 }
 
-func createUserCreds(t *testing.T, s *Server, akp nkeys.KeyPair) nats.Option {
+func createUserCredsEx(t *testing.T, nuc *jwt.UserClaims, akp nkeys.KeyPair) nats.Option {
 	t.Helper()
 	kp, _ := nkeys.CreateUser()
-	pub, _ := kp.PublicKey()
-	nuc := jwt.NewUserClaims(pub)
+	nuc.Subject, _ = kp.PublicKey()
 	ujwt, err := nuc.Encode(akp)
 	if err != nil {
 		t.Fatalf("Error generating user JWT: %v", err)
@@ -62,6 +66,10 @@ func createUserCreds(t *testing.T, s *Server, akp nkeys.KeyPair) nats.Option {
 		return sig, nil
 	}
 	return nats.UserJWT(userCB, sigCB)
+}
+
+func createUserCreds(t *testing.T, _ *Server, akp nkeys.KeyPair) nats.Option {
+	return createUserCredsEx(t, jwt.NewUserClaims("test"), akp)
 }
 
 func runTrustedServer(t *testing.T) (*Server, *Options) {
@@ -420,18 +428,18 @@ func runSolicitWithCredentials(t *testing.T, opts *Options, creds string) (*Serv
 }
 
 // Helper function to check that a leaf node has connected to our server.
-func checkLeafNodeConnected(t *testing.T, s *Server) {
+func checkLeafNodeConnected(t testing.TB, s *Server) {
 	t.Helper()
 	checkLeafNodeConnectedCount(t, s, 1)
 }
 
 // Helper function to check that a leaf node has connected to n server.
-func checkLeafNodeConnectedCount(t *testing.T, s *Server, lnCons int) {
+func checkLeafNodeConnectedCount(t testing.TB, s *Server, lnCons int) {
 	t.Helper()
 	checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
 		if nln := s.NumLeafNodes(); nln != lnCons {
-			return fmt.Errorf("Expected %d connected leafnode(s) for server %q, got %d",
-				lnCons, s.ID(), nln)
+			return fmt.Errorf("Expected %d connected leafnode(s) for server %v, got %d",
+				lnCons, s, nln)
 		}
 		return nil
 	})
@@ -467,11 +475,9 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 	}
 	seed, _ := kp.Seed()
 	mycreds := genCredsFile(t, ujwt, seed)
-	defer removeFile(t, mycreds)
 
 	// Create a server that solicits a leafnode connection.
-	sl, slopts, lnconf := runSolicitWithCredentials(t, opts, mycreds)
-	defer removeFile(t, lnconf)
+	sl, slopts, _ := runSolicitWithCredentials(t, opts, mycreds)
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, s)
@@ -780,6 +786,7 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error on connect: %v", err)
 		}
+		defer nc.Close()
 		clients = append(clients, nc)
 	}
 
@@ -1162,7 +1169,6 @@ func TestSystemAccountFromConfig(t *testing.T) {
     `
 
 	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, opub, apub, ts.URL)))
-	defer removeFile(t, conf)
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -1216,6 +1222,7 @@ func TestAccountClaimsUpdates(t *testing.T) {
 		claimUpdateSubj := fmt.Sprintf(subj, pub)
 		nc.Publish(claimUpdateSubj, []byte(ajwt))
 		nc.Flush()
+		time.Sleep(200 * time.Millisecond)
 
 		acc, _ = s.LookupAccount(pub)
 		if acc.MaxActiveConnections() != 8 {
@@ -1235,15 +1242,16 @@ func TestAccountReqMonitoring(t *testing.T) {
 	defer s.Shutdown()
 	sacc, sakp := createAccount(s)
 	s.setSystemAccount(sacc)
-	s.EnableJetStream(nil)
+	s.EnableJetStream(&JetStreamConfig{StoreDir: t.TempDir()})
+	unusedAcc, _ := createAccount(s)
 	acc, akp := createAccount(s)
-	if acc == nil {
-		t.Fatalf("did not create account")
-	}
 	acc.EnableJetStream(nil)
-	subsz := fmt.Sprintf(accReqSubj, acc.Name, "SUBSZ")
-	connz := fmt.Sprintf(accReqSubj, acc.Name, "CONNZ")
-	jsz := fmt.Sprintf(accReqSubj, acc.Name, "JSZ")
+	subsz := fmt.Sprintf(accDirectReqSubj, acc.Name, "SUBSZ")
+	connz := fmt.Sprintf(accDirectReqSubj, acc.Name, "CONNZ")
+	jsz := fmt.Sprintf(accDirectReqSubj, acc.Name, "JSZ")
+
+	pStatz := fmt.Sprintf(accPingReqSubj, "STATZ")
+	statz := func(name string) string { return fmt.Sprintf(accDirectReqSubj, name, "STATZ") }
 	// Create system account connection to query
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	ncSys, err := nats.Connect(url, createUserCreds(t, s, sakp))
@@ -1258,42 +1266,96 @@ func TestAccountReqMonitoring(t *testing.T) {
 	}
 	defer nc.Close()
 	// query SUBSZ for account
-	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
-		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":3,`) {
-		t.Fatalf("unexpected subs count (expected 3): %v", string(resp.Data))
-	}
+	resp, err := ncSys.Request(subsz, nil, time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), `"num_subscriptions":5,`)
 	// create a subscription
-	if sub, err := nc.Subscribe("foo", func(msg *nats.Msg) {}); err != nil {
-		t.Fatalf("error on subscribe %v", err)
-	} else {
-		defer sub.Unsubscribe()
-	}
-	nc.Flush()
+	sub, err := nc.Subscribe("foo", func(msg *nats.Msg) {})
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	require_NoError(t, nc.Flush())
 	// query SUBSZ for account
-	if resp, err := ncSys.Request(subsz, nil, time.Second); err != nil {
-		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_subscriptions":4,`) {
-		t.Fatalf("unexpected subs count (expected 4): %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"subject":"foo"`) {
-		t.Fatalf("expected subscription foo: %v", string(resp.Data))
-	}
+	resp, err = ncSys.Request(subsz, nil, time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), `"num_subscriptions":6,`, `"subject":"foo"`)
 	// query connections for account
-	if resp, err := ncSys.Request(connz, nil, time.Second); err != nil {
-		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"num_connections":1,`) {
-		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"total":1,`) {
-		t.Fatalf("unexpected subs count (expected 1): %v", string(resp.Data))
-	}
+	resp, err = ncSys.Request(connz, nil, time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), `"num_connections":1,`, `"total":1,`)
 	// query connections for js account
-	if resp, err := ncSys.Request(jsz, nil, time.Second); err != nil {
-		t.Fatalf("Error on request: %v", err)
-	} else if !strings.Contains(string(resp.Data), `"memory":0,`) {
-		t.Fatalf("jetstream should be enabled but empty: %v", string(resp.Data))
-	} else if !strings.Contains(string(resp.Data), `"storage":0,`) {
-		t.Fatalf("jetstream should be enabled but empty: %v", string(resp.Data))
-	}
+	resp, err = ncSys.Request(jsz, nil, time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), `"memory":0,`, `"storage":0,`)
+	// query statz/conns for account
+	resp, err = ncSys.Request(statz(acc.Name), nil, time.Second)
+	require_NoError(t, err)
+	respContentAcc := []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":0,"bytes":0}`,
+		`"received":{"msgs":0,"bytes":0}`, `"num_subscriptions":`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
+	require_Contains(t, string(resp.Data), respContentAcc...)
+
+	rIb := ncSys.NewRespInbox()
+	rSub, err := ncSys.SubscribeSync(rIb)
+	require_NoError(t, err)
+	require_NoError(t, ncSys.PublishRequest(pStatz, rIb, nil))
+	minRespContentForBothAcc := []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"acc":"`, `"num_subscriptions":`}
+	resp, err = rSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), minRespContentForBothAcc...)
+	// expect one entry per account
+	require_Contains(t, string(resp.Data), fmt.Sprintf(`"acc":"%s"`, acc.Name), fmt.Sprintf(`"acc":"%s"`, sacc.Name))
+
+	// Test ping with filter by account name
+	require_NoError(t, ncSys.PublishRequest(pStatz, rIb, []byte(fmt.Sprintf(`{"accounts":["%s"]}`, sacc.Name))))
+	m, err := rSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(m.Data), minRespContentForBothAcc...)
+
+	require_NoError(t, ncSys.PublishRequest(pStatz, rIb, []byte(fmt.Sprintf(`{"accounts":["%s"]}`, acc.Name))))
+	m, err = rSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(m.Data), respContentAcc...)
+
+	// Test include unused for statz and ping of statz
+	unusedContent := []string{`"conns":0,`, `"total_conns":0`, `"slow_consumers":0`,
+		fmt.Sprintf(`"acc":"%s"`, unusedAcc.Name)}
+
+	resp, err = ncSys.Request(statz(unusedAcc.Name),
+		[]byte(fmt.Sprintf(`{"accounts":["%s"], "include_unused":true}`, unusedAcc.Name)),
+		time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), unusedContent...)
+
+	require_NoError(t, ncSys.PublishRequest(pStatz, rIb,
+		[]byte(fmt.Sprintf(`{"accounts":["%s"], "include_unused":true}`, unusedAcc.Name))))
+	resp, err = rSub.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(resp.Data), unusedContent...)
+
+	require_NoError(t, ncSys.PublishRequest(pStatz, rIb, []byte(fmt.Sprintf(`{"accounts":["%s"]}`, unusedAcc.Name))))
+	_, err = rSub.NextMsg(200 * time.Millisecond)
+	require_Error(t, err)
+
+	// Test ping from within account, send extra message to check counters.
+	require_NoError(t, nc.Publish("foo", nil))
+	ib := nc.NewRespInbox()
+	rSub, err = nc.SubscribeSync(ib)
+	require_NoError(t, err)
+	require_NoError(t, nc.PublishRequest(pStatz, ib, nil))
+	require_NoError(t, nc.Flush())
+	resp, err = rSub.NextMsg(time.Second)
+	require_NoError(t, err)
+
+	// Since we now have processed our own message, sent msgs will be at least 1.
+	payload := string(resp.Data)
+	respContentAcc = []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":1,"bytes":0}`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
+	require_Contains(t, payload, respContentAcc...)
+
+	// Depending on timing, statz message could be accounted too.
+	receivedOK := strings.Contains(payload, `"received":{"msgs":1,"bytes":0}`) || strings.Contains(payload, `"received":{"msgs":2,"bytes":0}`)
+	require_True(t, receivedOK)
+	_, err = rSub.NextMsg(200 * time.Millisecond)
+	require_Error(t, err)
 }
 
 func TestAccountReqInfo(t *testing.T) {
@@ -1309,7 +1371,7 @@ func TestAccountReqInfo(t *testing.T) {
 	ajwt1, _ := nac1.Encode(oKp)
 	addAccountToMemResolver(s, pub1, ajwt1)
 	s.LookupAccount(pub1)
-	info1 := fmt.Sprintf(accReqSubj, pub1, "INFO")
+	info1 := fmt.Sprintf(accDirectReqSubj, pub1, "INFO")
 	// Now add an account with service imports.
 	akp2, _ := nkeys.CreateAccount()
 	pub2, _ := akp2.PublicKey()
@@ -1318,7 +1380,7 @@ func TestAccountReqInfo(t *testing.T) {
 	ajwt2, _ := nac2.Encode(oKp)
 	addAccountToMemResolver(s, pub2, ajwt2)
 	s.LookupAccount(pub2)
-	info2 := fmt.Sprintf(accReqSubj, pub2, "INFO")
+	info2 := fmt.Sprintf(accDirectReqSubj, pub2, "INFO")
 	// Create system account connection to query
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	ncSys, err := nats.Connect(url, createUserCreds(t, s, sakp))
@@ -1366,7 +1428,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 1 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 2 {
+	} else if len(info.Imports) != 4 {
 		t.Fatalf("Unexpected value: %+v", info.Imports)
 	} else if info.Exports[0].Subject != "req.*" {
 		t.Fatalf("Unexpected value: %v", info.Exports)
@@ -1374,7 +1436,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unexpected value: %v", info.Exports)
 	} else if info.Exports[0].ResponseType != jwt.ResponseTypeSingleton {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if info.SubCnt != 2 {
+	} else if info.SubCnt != 4 {
 		t.Fatalf("Unexpected value: %v", info.SubCnt)
 	} else {
 		checkCommon(&info, &srv, pub1, ajwt1)
@@ -1387,7 +1449,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unmarshalling failed: %v", err)
 	} else if len(info.Exports) != 0 {
 		t.Fatalf("Unexpected value: %v", info.Exports)
-	} else if len(info.Imports) != 3 {
+	} else if len(info.Imports) != 5 {
 		t.Fatalf("Unexpected value: %+v", info.Imports)
 	}
 	// Here we need to find our import
@@ -1405,7 +1467,7 @@ func TestAccountReqInfo(t *testing.T) {
 		t.Fatalf("Unexpected value: %+v", si)
 	} else if si.Account != pub1 {
 		t.Fatalf("Unexpected value: %+v", si)
-	} else if info.SubCnt != 3 {
+	} else if info.SubCnt != 5 {
 		t.Fatalf("Unexpected value: %+v", si)
 	} else {
 		checkCommon(&info, &srv, pub2, ajwt2)
@@ -1462,6 +1524,7 @@ func TestAccountClaimsUpdatesWithServiceImports(t *testing.T) {
 		nc.Publish(claimUpdateSubj, []byte(ajwt2))
 	}
 	nc.Flush()
+	time.Sleep(50 * time.Millisecond)
 
 	if startSubs < s.NumSubscriptions() {
 		t.Fatalf("Subscriptions leaked: %d vs %d", startSubs, s.NumSubscriptions())
@@ -1541,11 +1604,15 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	newConns := make([]*nats.Conn, 0, 5)
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	for i := 0; i < 5; i++ {
-		nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		require_NoError(t, err)
+		defer nc.Close()
 	}
 	time.Sleep(500 * time.Millisecond)
 	for i := 0; i < 5; i++ {
-		nc, _ := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		require_NoError(t, err)
+		defer nc.Close()
 		newConns = append(newConns, nc)
 	}
 
@@ -1588,7 +1655,7 @@ func TestSystemAccountWithBadRemoteLatencyUpdate(t *testing.T) {
 		ReqId:   "_INBOX.22",
 	}
 	b, _ := json.Marshal(&rl)
-	s.remoteLatencyUpdate(nil, nil, nil, "foo", _EMPTY_, b)
+	s.remoteLatencyUpdate(nil, nil, nil, "foo", _EMPTY_, nil, b)
 }
 
 func TestSystemAccountWithGateways(t *testing.T) {
@@ -1607,8 +1674,8 @@ func TestSystemAccountWithGateways(t *testing.T) {
 	nca.Flush()
 
 	// If this tests fails with wrong number after 10 seconds we may have
-	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 40, sa)
+	// added a new initial subscription for the eventing system.
+	checkExpectedSubs(t, 58, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1622,12 +1689,10 @@ func TestSystemAccountWithGateways(t *testing.T) {
 	require_NoError(t, err)
 	msgs[1], err = sub.NextMsg(time.Second)
 	require_NoError(t, err)
-	msgs[2], err = sub.NextMsg(time.Second)
-	require_NoError(t, err)
 	// TODO: There is a race currently that can cause the server to process the
 	// system event *after* the subscription on "A" has been registered, and so
 	// the "nca" client would receive its own CONNECT message.
-	msgs[3], _ = sub.NextMsg(250 * time.Millisecond)
+	msgs[2], _ = sub.NextMsg(250 * time.Millisecond)
 
 	findMsgs := func(sub string) []*nats.Msg {
 		rMsgs := []*nats.Msg{}
@@ -1655,10 +1720,6 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	connsMsgA := findMsgs(fmt.Sprintf("$SYS.ACCOUNT.%s.SERVER.CONNS", sa.SystemAccount().Name))
 	if len(connsMsgA) != 1 {
-		t.Fatal("Expected a message")
-	}
-	connsMsgG := findMsgs("$SYS.ACCOUNT.$G.SERVER.CONNS")
-	if len(connsMsgG) != 1 {
 		t.Fatal("Expected a message")
 	}
 }
@@ -1721,6 +1782,52 @@ func TestSystemAccountNoAuthUser(t *testing.T) {
 	}
 }
 
+func TestServerAccountConns(t *testing.T) {
+	// speed up hb
+	orgHBInterval := eventsHBInterval
+	eventsHBInterval = time.Millisecond * 100
+	defer func() { eventsHBInterval = orgHBInterval }()
+	conf := createConfFile(t, []byte(`
+	   host: 127.0.0.1
+	   port: -1
+	   system_account: SYS
+	   accounts: {
+			   SYS: {users: [{user: s, password: s}]}
+			   ACC: {users: [{user: a, password: a}]}
+	   }`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("a", "a"))
+	defer nc.Close()
+
+	subOut, err := nc.SubscribeSync("foo")
+	require_NoError(t, err)
+	hw := "HELLO WORLD"
+	nc.Publish("foo", []byte(hw))
+	nc.Publish("bar", []byte(hw)) // will only count towards received
+	nc.Flush()
+	m, err := subOut.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, string(m.Data), hw)
+
+	ncs := natsConnect(t, s.ClientURL(), nats.UserInfo("s", "s"))
+	defer ncs.Close()
+	subs, err := ncs.SubscribeSync("$SYS.ACCOUNT.ACC.SERVER.CONNS")
+	require_NoError(t, err)
+
+	m, err = subs.NextMsg(time.Second)
+	require_NoError(t, err)
+	accConns := &AccountNumConns{}
+	err = json.Unmarshal(m.Data, accConns)
+	require_NoError(t, err)
+
+	require_True(t, accConns.Received.Msgs == 2)
+	require_True(t, accConns.Received.Bytes == 2*int64(len(hw)))
+	require_True(t, accConns.Sent.Msgs == 1)
+	require_True(t, accConns.Sent.Bytes == int64(len(hw)))
+}
+
 func TestServerEventsStatsZ(t *testing.T) {
 	serverStatsReqSubj := "$SYS.REQ.SERVER.%s.STATSZ"
 	preStart := time.Now().UTC()
@@ -1781,8 +1888,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m.Stats.Connections)
 	}
-	if m.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m.Stats.ActiveAccounts)
+	if m.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m.Stats.ActiveAccounts)
 	}
 	if m.Stats.Sent.Msgs < 1 {
 		t.Fatalf("Did not match sent msgs of >=1, got %d", m.Stats.Sent.Msgs)
@@ -1790,8 +1897,10 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m.Stats.Received.Msgs < 1 {
 		t.Fatalf("Did not match received msgs of >=1, got %d", m.Stats.Received.Msgs)
 	}
-	if lr := len(m.Stats.Routes); lr != 1 {
-		t.Fatalf("Expected a route, but got %d", lr)
+	// Default pool size + 1 for system account
+	expectedRoutes := DEFAULT_ROUTE_POOL_SIZE + 1
+	if lr := len(m.Stats.Routes); lr != expectedRoutes {
+		t.Fatalf("Expected %d routes, but got %d", expectedRoutes, lr)
 	}
 
 	// Now let's prompt this server to send us the statsz
@@ -1810,8 +1919,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m2.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m2.Stats.Connections)
 	}
-	if m2.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m2.Stats.ActiveAccounts)
+	if m2.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m2.Stats.ActiveAccounts)
 	}
 	if m2.Stats.Sent.Msgs < 3 {
 		t.Fatalf("Did not match sent msgs of >= 3, got %d", m2.Stats.Sent.Msgs)
@@ -1819,8 +1928,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m2.Stats.Received.Msgs < 1 {
 		t.Fatalf("Did not match received msgs of >= 1, got %d", m2.Stats.Received.Msgs)
 	}
-	if lr := len(m2.Stats.Routes); lr != 1 {
-		t.Fatalf("Expected a route, but got %d", lr)
+	if lr := len(m2.Stats.Routes); lr != expectedRoutes {
+		t.Fatalf("Expected %d routes, but got %d", expectedRoutes, lr)
 	}
 
 	msg, err = ncs.Request(subj, nil, time.Second)
@@ -1837,8 +1946,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m3.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m3.Stats.Connections)
 	}
-	if m3.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m3.Stats.ActiveAccounts)
+	if m3.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m3.Stats.ActiveAccounts)
 	}
 	if m3.Stats.Sent.Msgs < 4 {
 		t.Fatalf("Did not match sent msgs of >= 4, got %d", m3.Stats.Sent.Msgs)
@@ -1846,11 +1955,13 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m3.Stats.Received.Msgs < 2 {
 		t.Fatalf("Did not match received msgs of >= 2, got %d", m3.Stats.Received.Msgs)
 	}
-	if lr := len(m3.Stats.Routes); lr != 1 {
-		t.Fatalf("Expected a route, but got %d", lr)
+	if lr := len(m3.Stats.Routes); lr != expectedRoutes {
+		t.Fatalf("Expected %d routes, but got %d", expectedRoutes, lr)
 	}
-	if sr := m3.Stats.Routes[0]; sr.Name != "B_SRV" {
-		t.Fatalf("Expected server A's route to B to have Name set to %q, got %q", "B", sr.Name)
+	for _, sr := range m3.Stats.Routes {
+		if sr.Name != "B_SRV" {
+			t.Fatalf("Expected server A's route to B to have Name set to %q, got %q", "B", sr.Name)
+		}
 	}
 
 	// Now query B and check that route's name is "A"
@@ -1864,11 +1975,813 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &m); err != nil {
 		t.Fatalf("Error unmarshalling the statz json: %v", err)
 	}
-	if lr := len(m.Stats.Routes); lr != 1 {
-		t.Fatalf("Expected a route, but got %d", lr)
+	if lr := len(m.Stats.Routes); lr != expectedRoutes {
+		t.Fatalf("Expected %d routes, but got %d", expectedRoutes, lr)
 	}
-	if sr := m.Stats.Routes[0]; sr.Name != "A_SRV" {
-		t.Fatalf("Expected server B's route to A to have Name set to %q, got %q", "A_SRV", sr.Name)
+	for _, sr := range m.Stats.Routes {
+		if sr.Name != "A_SRV" {
+			t.Fatalf("Expected server B's route to A to have Name set to %q, got %q", "A_SRV", sr.Name)
+		}
+	}
+}
+
+func TestServerEventsHealthZSingleServer(t *testing.T) {
+	type healthzResp struct {
+		Healthz HealthStatus `json:"data"`
+		Server  ServerInfo   `json:"server"`
+	}
+	cfg := fmt.Sprintf(`listen: 127.0.0.1:-1
+
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	no_auth_user: one
+
+	accounts {
+		ONE { users = [ { user: "one", pass: "p" } ]; jetstream: enabled }
+		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+	}`, t.TempDir())
+
+	serverHealthzReqSubj := "$SYS.REQ.SERVER.%s.HEALTHZ"
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(cfg)))
+	defer s.Shutdown()
+
+	ncs, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Error connecting to cluster: %v", err)
+	}
+
+	defer ncs.Close()
+	ncAcc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncAcc.Close()
+	js, err := ncAcc.JetStream()
+	if err != nil {
+		t.Fatalf("Error creating JetStream context: %v", err)
+	}
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "test",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Error creating stream: %v", err)
+	}
+	_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+		Name: "cons",
+	})
+	if err != nil {
+		t.Fatalf("Error creating consumer: %v", err)
+	}
+
+	subj := fmt.Sprintf(serverHealthzReqSubj, s.ID())
+
+	tests := []struct {
+		name     string
+		req      *HealthzEventOptions
+		expected HealthStatus
+	}{
+		{
+			name:     "no parameters",
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with js enabled only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSEnabledOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with server only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSServerOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name and stream",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "test",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name, stream and consumer",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "cons",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with stream only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Stream: "test",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Error:      `"account" must not be empty when checking stream health`,
+			},
+		},
+		{
+			name: "with stream only, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Details: true,
+					Stream:  "test",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Errors: []HealthzError{
+					{
+						Type:  HealthzErrorBadRequest,
+						Error: `"account" must not be empty when checking stream health`,
+					},
+				},
+			},
+		},
+		{
+			name: "with account and consumer",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Consumer: "cons",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Error:      `"stream" must not be empty when checking consumer health`,
+			},
+		},
+		{
+			name: "with account and consumer, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Consumer: "cons",
+					Details:  true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Errors: []HealthzError{
+					{
+						Type:  HealthzErrorBadRequest,
+						Error: `"stream" must not be empty when checking consumer health`,
+					},
+				},
+			},
+		},
+		{
+			name: "account not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream account "abc" not found`,
+			},
+		},
+		{
+			name: "account not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "abc",
+					Details: true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:    HealthzErrorAccount,
+						Account: "abc",
+						Error:   `JetStream account "abc" not found`,
+					},
+				},
+			},
+		},
+		{
+			name: "stream not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream stream "abc" not found on account "ONE"`,
+			},
+		},
+		{
+			name: "stream not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "abc",
+					Details: true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:    HealthzErrorStream,
+						Account: "ONE",
+						Stream:  "abc",
+						Error:   `JetStream stream "abc" not found on account "ONE"`,
+					},
+				},
+			},
+		},
+		{
+			name: "consumer not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream consumer "abc" not found for stream "test" on account "ONE"`,
+			},
+		},
+		{
+			name: "consumer not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "abc",
+					Details:  true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:     HealthzErrorConsumer,
+						Account:  "ONE",
+						Stream:   "test",
+						Consumer: "abc",
+						Error:    `JetStream consumer "abc" not found for stream "test" on account "ONE"`,
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var body []byte
+			var err error
+			if test.req != nil {
+				body, err = json.Marshal(test.req)
+				if err != nil {
+					t.Fatalf("Error marshaling request body: %v", err)
+				}
+			}
+			msg, err := ncs.Request(subj, body, 1*time.Second)
+			if err != nil {
+				t.Fatalf("Error trying to request healthz: %v", err)
+			}
+			var health healthzResp
+			if err := json.Unmarshal(msg.Data, &health); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
+			if !reflect.DeepEqual(health.Healthz, test.expected) {
+				t.Errorf("Invalid healthz status; want: %+v; got: %+v", test.expected, health.Healthz)
+			}
+		})
+	}
+}
+
+func TestServerEventsHealthZClustered(t *testing.T) {
+	type healthzResp struct {
+		Healthz HealthStatus `json:"data"`
+		Server  ServerInfo   `json:"server"`
+	}
+	serverHealthzReqSubj := "$SYS.REQ.SERVER.%s.HEALTHZ"
+	c := createJetStreamClusterWithTemplate(t, jsClusterAccountsTempl, "JSC", 3)
+	defer c.shutdown()
+
+	ncs, err := nats.Connect(c.randomServer().ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Error connecting to cluster: %v", err)
+	}
+
+	defer ncs.Close()
+	ncAcc, err := nats.Connect(c.randomServer().ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncAcc.Close()
+	js, err := ncAcc.JetStream()
+	if err != nil {
+		t.Fatalf("Error creating JetStream context: %v", err)
+	}
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "test",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Error creating stream: %v", err)
+	}
+	_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+		Name:     "cons",
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Error creating consumer: %v", err)
+	}
+
+	subj := fmt.Sprintf(serverHealthzReqSubj, c.servers[0].ID())
+	pingSubj := fmt.Sprintf(serverHealthzReqSubj, "PING")
+
+	tests := []struct {
+		name          string
+		req           *HealthzEventOptions
+		expected      HealthStatus
+		expectedError string
+	}{
+		{
+			name:     "no parameters",
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with js enabled only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSEnabledOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with server only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSServerOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name and stream",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "test",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with account name, stream and consumer",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "cons",
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with stream only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Stream: "test",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Error:      `"account" must not be empty when checking stream health`,
+			},
+			expectedError: "Bad request:",
+		},
+		{
+			name: "with stream only, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Details: true,
+					Stream:  "test",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 400,
+				Errors: []HealthzError{
+					{
+						Type:  HealthzErrorBadRequest,
+						Error: `"account" must not be empty when checking stream health`,
+					},
+				},
+			},
+		},
+		{
+			name: "account not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream account "abc" not found`,
+			},
+			expectedError: `account "abc" not found`,
+		},
+		{
+			name: "account not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "abc",
+					Details: true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:    HealthzErrorAccount,
+						Account: "abc",
+						Error:   `JetStream account "abc" not found`,
+					},
+				},
+			},
+		},
+		{
+			name: "stream not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream stream "abc" not found on account "ONE"`,
+			},
+			expectedError: `stream "abc" not found`,
+		},
+		{
+			name: "stream not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account: "ONE",
+					Stream:  "abc",
+					Details: true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:    HealthzErrorStream,
+						Account: "ONE",
+						Stream:  "abc",
+						Error:   `JetStream stream "abc" not found on account "ONE"`,
+					},
+				},
+			},
+		},
+		{
+			name: "consumer not found",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "abc",
+				},
+			},
+			expected: HealthStatus{
+				Status:     "unavailable",
+				StatusCode: 404,
+				Error:      `JetStream consumer "abc" not found for stream "test" on account "ONE"`,
+			},
+			expectedError: `consumer "abc" not found for stream "test"`,
+		},
+		{
+			name: "consumer not found, detailed",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					Account:  "ONE",
+					Stream:   "test",
+					Consumer: "abc",
+					Details:  true,
+				},
+			},
+			expected: HealthStatus{
+				Status:     "error",
+				StatusCode: 404,
+				Errors: []HealthzError{
+					{
+						Type:     HealthzErrorConsumer,
+						Account:  "ONE",
+						Stream:   "test",
+						Consumer: "abc",
+						Error:    `JetStream consumer "abc" not found for stream "test" on account "ONE"`,
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var body []byte
+			var err error
+			if test.req != nil {
+				body, err = json.Marshal(test.req)
+				if err != nil {
+					t.Fatalf("Error marshaling request body: %v", err)
+				}
+			}
+			msg, err := ncs.Request(subj, body, 1*time.Second)
+			if err != nil {
+				t.Fatalf("Error trying to request healthz: %v", err)
+			}
+			var health healthzResp
+			if err := json.Unmarshal(msg.Data, &health); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
+			if !reflect.DeepEqual(health.Healthz, test.expected) {
+				t.Errorf("Invalid healthz status; want: %+v; got: %+v", test.expected, health.Healthz)
+			}
+
+			reply := ncs.NewRespInbox()
+			sub, err := ncs.SubscribeSync(reply)
+			if err != nil {
+				t.Fatalf("Error creating subscription: %v", err)
+			}
+			defer sub.Unsubscribe()
+
+			// now PING all servers
+			if err := ncs.PublishRequest(pingSubj, reply, body); err != nil {
+				t.Fatalf("Publish error: %v", err)
+			}
+			for i := 0; i < 3; i++ {
+				msg, err := sub.NextMsg(1 * time.Second)
+				if err != nil {
+					t.Fatalf("Error fetching healthz PING response: %v", err)
+				}
+				var health healthzResp
+				if err := json.Unmarshal(msg.Data, &health); err != nil {
+					t.Fatalf("Error unmarshalling the statz json: %v", err)
+				}
+				if !reflect.DeepEqual(health.Healthz, test.expected) {
+					t.Errorf("Invalid healthz status; want: %+v; got: %+v", test.expected, health.Healthz)
+				}
+			}
+			if _, err := sub.NextMsg(50 * time.Millisecond); !errors.Is(err, nats.ErrTimeout) {
+				t.Fatalf("Expected timeout error; got: %v", err)
+			}
+		})
+	}
+}
+
+func TestServerEventsHealthZClustered_NoReplicas(t *testing.T) {
+	type healthzResp struct {
+		Healthz HealthStatus `json:"data"`
+		Server  ServerInfo   `json:"server"`
+	}
+	serverHealthzReqSubj := "$SYS.REQ.SERVER.%s.HEALTHZ"
+	c := createJetStreamClusterWithTemplate(t, jsClusterAccountsTempl, "JSC", 3)
+	defer c.shutdown()
+
+	ncs, err := nats.Connect(c.randomServer().ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Error connecting to cluster: %v", err)
+	}
+
+	defer ncs.Close()
+	ncAcc, err := nats.Connect(c.randomServer().ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncAcc.Close()
+	js, err := ncAcc.JetStream()
+	if err != nil {
+		t.Fatalf("Error creating JetStream context: %v", err)
+	}
+
+	pingSubj := fmt.Sprintf(serverHealthzReqSubj, "PING")
+
+	t.Run("non-replicated stream", func(t *testing.T) {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "test",
+			Subjects: []string{"foo"},
+		})
+		if err != nil {
+			t.Fatalf("Error creating stream: %v", err)
+		}
+		_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+			Name: "cons",
+		})
+		if err != nil {
+			t.Fatalf("Error creating consumer: %v", err)
+		}
+		body, err := json.Marshal(HealthzEventOptions{
+			HealthzOptions: HealthzOptions{
+				Account: "ONE",
+				Stream:  "test",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Error marshaling request body: %v", err)
+		}
+
+		reply := ncs.NewRespInbox()
+		sub, err := ncs.SubscribeSync(reply)
+		if err != nil {
+			t.Fatalf("Error creating subscription: %v", err)
+		}
+		defer sub.Unsubscribe()
+
+		// now PING all servers
+		if err := ncs.PublishRequest(pingSubj, reply, body); err != nil {
+			t.Fatalf("Publish error: %v", err)
+		}
+		var healthy int
+		for i := 0; i < 3; i++ {
+			msg, err := sub.NextMsg(1 * time.Second)
+			if err != nil {
+				t.Fatalf("Error fetching healthz PING response: %v", err)
+			}
+			var health healthzResp
+			if err := json.Unmarshal(msg.Data, &health); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
+			if health.Healthz.Status == "ok" {
+				healthy++
+				continue
+			}
+			if !strings.Contains(health.Healthz.Error, `stream "test" not found`) {
+				t.Errorf("Expected error to contain: %q, got: %s", `stream "test" not found`, health.Healthz.Error)
+			}
+		}
+		if healthy != 1 {
+			t.Fatalf("Expected 1 healthy server; got: %d", healthy)
+		}
+		if _, err := sub.NextMsg(50 * time.Millisecond); !errors.Is(err, nats.ErrTimeout) {
+			t.Fatalf("Expected timeout error; got: %v", err)
+		}
+	})
+
+	t.Run("non-replicated consumer", func(t *testing.T) {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "test-repl",
+			Subjects: []string{"bar"},
+			Replicas: 3,
+		})
+		if err != nil {
+			t.Fatalf("Error creating stream: %v", err)
+		}
+		_, err = js.AddConsumer("test-repl", &nats.ConsumerConfig{
+			Name: "cons-single",
+		})
+		if err != nil {
+			t.Fatalf("Error creating consumer: %v", err)
+		}
+		body, err := json.Marshal(HealthzEventOptions{
+			HealthzOptions: HealthzOptions{
+				Account:  "ONE",
+				Stream:   "test-repl",
+				Consumer: "cons-single",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Error marshaling request body: %v", err)
+		}
+
+		reply := ncs.NewRespInbox()
+		sub, err := ncs.SubscribeSync(reply)
+		if err != nil {
+			t.Fatalf("Error creating subscription: %v", err)
+		}
+		defer sub.Unsubscribe()
+
+		// now PING all servers
+		if err := ncs.PublishRequest(pingSubj, reply, body); err != nil {
+			t.Fatalf("Publish error: %v", err)
+		}
+		var healthy int
+		for i := 0; i < 3; i++ {
+			msg, err := sub.NextMsg(1 * time.Second)
+			if err != nil {
+				t.Fatalf("Error fetching healthz PING response: %v", err)
+			}
+			var health healthzResp
+			if err := json.Unmarshal(msg.Data, &health); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
+			if health.Healthz.Status == "ok" {
+				healthy++
+				continue
+			}
+			if !strings.Contains(health.Healthz.Error, `consumer "cons-single" not found`) {
+				t.Errorf("Expected error to contain: %q, got: %s", `consumer "cons-single" not found`, health.Healthz.Error)
+			}
+		}
+		if healthy != 1 {
+			t.Fatalf("Expected 1 healthy server; got: %d", healthy)
+		}
+		if _, err := sub.NextMsg(50 * time.Millisecond); !errors.Is(err, nats.ErrTimeout) {
+			t.Fatalf("Expected timeout error; got: %v", err)
+		}
+	})
+
+}
+
+func TestServerEventsHealthZJetStreamNotEnabled(t *testing.T) {
+	type healthzResp struct {
+		Healthz HealthStatus `json:"data"`
+		Server  ServerInfo   `json:"server"`
+	}
+	cfg := `listen: 127.0.0.1:-1
+
+	accounts {
+		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+	}`
+
+	serverHealthzReqSubj := "$SYS.REQ.SERVER.%s.HEALTHZ"
+	s, _ := RunServerWithConfig(createConfFile(t, []byte(cfg)))
+	defer s.Shutdown()
+
+	ncs, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Error connecting to cluster: %v", err)
+	}
+
+	defer ncs.Close()
+
+	subj := fmt.Sprintf(serverHealthzReqSubj, s.ID())
+
+	msg, err := ncs.Request(subj, nil, 1*time.Second)
+	if err != nil {
+		t.Fatalf("Error trying to request healthz: %v", err)
+	}
+	var health healthzResp
+	if err := json.Unmarshal(msg.Data, &health); err != nil {
+		t.Fatalf("Error unmarshalling the statz json: %v", err)
+	}
+	if health.Healthz.Status != "ok" {
+		t.Errorf("Invalid healthz status; want: %q; got: %q", "ok", health.Healthz.Status)
+	}
+	if health.Healthz.Error != "" {
+		t.Errorf("HealthZ error: %s", health.Healthz.Error)
 	}
 }
 
@@ -1990,7 +2903,7 @@ func TestServerEventsPingStatsZFailFilter(t *testing.T) {
 	if msg, err := nc.Request(serverStatsPingReqSubj, []byte(`{MALFORMEDJSON`), time.Second/4); err != nil {
 		t.Fatalf("Error: %v", err)
 	} else {
-		resp := make(map[string]map[string]interface{})
+		resp := make(map[string]map[string]any)
 		if err := json.Unmarshal(msg.Data, &resp); err != nil {
 			t.Fatalf("Error unmarshalling the response json: %v", err)
 		}
@@ -2016,8 +2929,8 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 
 	tests := []struct {
 		endpoint  string
-		opt       interface{}
-		resp      interface{}
+		opt       any
+		resp      any
 		respField []string
 	}{
 		{"VARZ", nil, &Varz{},
@@ -2073,6 +2986,11 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			[]string{"now", "routes"}},
 
 		{"JSZ", nil, &JSzOptions{}, []string{"now", "disabled"}},
+
+		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
+		{"HEALTHZ", &HealthzOptions{JSEnabledOnly: true}, &JSzOptions{}, []string{"status"}},
+		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
+		{"EXPVARZ", nil, &ExpvarzStatus{}, []string{"memstats", "cmdline"}},
 	}
 
 	for i, test := range tests {
@@ -2100,7 +3018,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error receiving msg: %v", err)
 			}
-			response1 := make(map[string]map[string]interface{})
+			response1 := make(map[string]map[string]any)
 
 			if err := json.Unmarshal(msg.Data, &response1); err != nil {
 				t.Fatalf("Error unmarshalling response1 json: %v", err)
@@ -2129,7 +3047,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error receiving msg: %v", err)
 			}
-			response2 := make(map[string]map[string]interface{})
+			response2 := make(map[string]map[string]any)
 			if err := json.Unmarshal(msg.Data, &response2); err != nil {
 				t.Fatalf("Error unmarshalling the response2 json: %v", err)
 			}
@@ -2141,8 +3059,10 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 					strings.ToLower(test.endpoint), string(msg.Data))
 			} else {
 				for _, respField := range test.respField {
-					if _, ok := resp[respField]; !ok {
+					if val, ok := resp[respField]; !ok {
 						t.Fatalf("Error finding: %s in %s", respField, resp)
+					} else if val == nil {
+						t.Fatalf("Nil value found: %s in %s", respField, resp)
 					}
 				}
 			}
@@ -2305,7 +3225,6 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 		}
 		no_auth_user: b
     `))
-	defer removeFile(t, confA)
 	sA, _ := RunServerWithConfig(confA)
 	defer sA.Shutdown()
 	confB := createConfFile(t, []byte(fmt.Sprintf(`
@@ -2330,7 +3249,6 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 		}
 		no_auth_user: b
     `, sA.opts.Cluster.Port)))
-	defer removeFile(t, confB)
 	sB, _ := RunServerWithConfig(confB)
 	defer sB.Shutdown()
 	checkClusterFormed(t, sA, sB)
@@ -2370,4 +3288,253 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 	m2 := <-msgs
 	require_Contains(t, string(m1.Data)+string(m2.Data), "srv-A", "srv-B", "foo", "bar", "baz")
 	require_Len(t, len(msgs), 0)
+}
+
+// https://github.com/nats-io/nats-server/issues/3177
+func TestServerEventsAndDQSubscribers(t *testing.T) {
+	c := createJetStreamClusterWithTemplate(t, jsClusterAccountsTempl, "DDQ", 3)
+	defer c.shutdown()
+
+	nc, err := nats.Connect(c.randomServer().ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.QueueSubscribeSync("$SYS.ACCOUNT.*.DISCONNECT", "qq")
+	require_NoError(t, err)
+	nc.Flush()
+
+	// Create and disconnect 10 random connections.
+	for i := 0; i < 10; i++ {
+		nc, err := nats.Connect(c.randomServer().ClientURL())
+		require_NoError(t, err)
+		nc.Close()
+	}
+
+	checkSubsPending(t, sub, 10)
+}
+
+func TestServerEventsStatszSingleServer(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts { $SYS { users [{user: "admin", password: "p1d"}]} }
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Grab internal system client.
+	s.mu.RLock()
+	sysc := s.sys.client
+	wait := s.sys.cstatsz + 25*time.Millisecond
+	s.mu.RUnlock()
+
+	// Wait for when first statsz would have gone out..
+	time.Sleep(wait)
+
+	sysc.mu.Lock()
+	outMsgs := sysc.stats.outMsgs
+	sysc.mu.Unlock()
+
+	require_True(t, outMsgs == 0)
+
+	// Connect as a system user and make sure if there is
+	// subscription interest that we will receive updates.
+	nc, _ := jsClientConnect(t, s, nats.UserInfo("admin", "p1d"))
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(fmt.Sprintf(serverStatsSubj, "*"))
+	require_NoError(t, err)
+
+	checkSubsPending(t, sub, 1)
+}
+
+func TestServerEventsReload(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts: {
+			$SYS { users [{user: "admin", password: "p1d"}]}
+			test { users [{user: "foo", password: "bar"}]}
+		}
+		ping_interval: "100ms"
+	`))
+	opts := LoadConfig(conf)
+	s := RunServer(opts)
+	defer s.Shutdown()
+	subject := fmt.Sprintf(serverReloadReqSubj, s.info.ID)
+
+	// Connect as a test user and make sure the reload endpoint is not
+	// accessible.
+	ncTest, _ := jsClientConnect(t, s, nats.UserInfo("foo", "bar"))
+	defer ncTest.Close()
+	testReply := ncTest.NewRespInbox()
+	sub, err := ncTest.SubscribeSync(testReply)
+	require_NoError(t, err)
+	err = ncTest.PublishRequest(subject, testReply, nil)
+	require_NoError(t, err)
+	_, err = sub.NextMsg(time.Second)
+	require_Error(t, err)
+
+	require_True(t, s.getOpts().PingInterval == 100*time.Millisecond)
+
+	// Connect as a system user.
+	nc, _ := jsClientConnect(t, s, nats.UserInfo("admin", "p1d"))
+	defer nc.Close()
+
+	// rewrite the config file with a different ping interval
+	err = os.WriteFile(conf, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts: {
+			$SYS { users [{user: "admin", password: "p1d"}]}
+			test { users [{user: "foo", password: "bar"}]}
+		}
+		ping_interval: "200ms"
+	`), 0666)
+	require_NoError(t, err)
+
+	msg, err := nc.Request(subject, nil, time.Second)
+	require_NoError(t, err)
+
+	var apiResp = ServerAPIResponse{}
+	err = json.Unmarshal(msg.Data, &apiResp)
+	require_NoError(t, err)
+
+	require_True(t, apiResp.Data == nil)
+	require_True(t, apiResp.Error == nil)
+
+	// See that the ping interval has changed.
+	require_True(t, s.getOpts().PingInterval == 200*time.Millisecond)
+
+	// rewrite the config file with a different ping interval
+	err = os.WriteFile(conf, []byte(`garbage and nonsense`), 0666)
+	require_NoError(t, err)
+
+	// Request the server to reload and wait for the response.
+	msg, err = nc.Request(subject, nil, time.Second)
+	require_NoError(t, err)
+
+	apiResp = ServerAPIResponse{}
+	err = json.Unmarshal(msg.Data, &apiResp)
+	require_NoError(t, err)
+
+	require_True(t, apiResp.Data == nil)
+	require_Error(t, apiResp.Error, fmt.Errorf("Parse error on line 1: 'Expected a top-level value to end with a new line, comment or EOF, but got 'n' instead.'"))
+
+	// See that the ping interval has not changed.
+	require_True(t, s.getOpts().PingInterval == 200*time.Millisecond)
+}
+
+func TestServerEventsLDMKick(t *testing.T) {
+	ldmed := make(chan bool, 1)
+	disconnected := make(chan bool, 1)
+
+	s, opts := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	s.setSystemAccount(acc)
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncs.Close()
+
+	_, akp2 := createAccount(s)
+
+	nc, err := nats.Connect(url, createUserCreds(t, s, akp2), nats.Name("TEST EVENTS LDM+KICK"), nats.LameDuckModeHandler(func(_ *nats.Conn) { ldmed <- true }))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	nc.SetDisconnectErrHandler(func(_ *nats.Conn, err error) { disconnected <- true })
+
+	cid, err := nc.GetClientID()
+	if err != nil {
+		t.Fatalf("Error on getting the CID: %v", err)
+	}
+
+	reqldm := LDMClientReq{CID: cid}
+	reqldmpayload, _ := json.Marshal(reqldm)
+	reqkick := KickClientReq{CID: cid}
+	reqkickpayload, _ := json.Marshal(reqkick)
+
+	// Test for data races when getting the client by ID
+	uc := createUserCreds(t, s, akp2)
+	totalClients := 100
+	someClients := make([]*nats.Conn, 0, totalClients)
+	for i := 0; i < totalClients; i++ {
+		nc, err := nats.Connect(s.ClientURL(), uc)
+		require_NoError(t, err)
+		defer nc.Close()
+		someClients = append(someClients, nc)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < totalClients; i++ {
+			someClients[i].Close()
+		}
+	}()
+	defer wg.Wait()
+
+	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.LDM", s.ID()), reqldmpayload, time.Second)
+	require_NoError(t, err)
+
+	select {
+	case <-ldmed:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for the connection to receive the LDM signal")
+	}
+
+	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.KICK", s.ID()), reqkickpayload, time.Second)
+	require_NoError(t, err)
+
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for the client to get disconnected")
+	}
+}
+
+func Benchmark_GetHash(b *testing.B) {
+	b.StopTimer()
+	// Get 100 random names
+	names := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		names = append(names, nuid.Next())
+	}
+	hashes := make([]string, 0, 100)
+	for j := 0; j < 100; j++ {
+		sha := sha256.New()
+		sha.Write([]byte(names[j]))
+		b := sha.Sum(nil)
+		for i := 0; i < 8; i++ {
+			b[i] = digits[int(b[i]%base)]
+		}
+		hashes = append(hashes, string(b[:8]))
+	}
+	wg := sync.WaitGroup{}
+	wg.Add(8)
+	errCh := make(chan error, 8)
+	b.StartTimer()
+	for i := 0; i < 8; i++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < b.N; i++ {
+				idx := rand.Intn(100)
+				if h := getHash(names[idx]); h != hashes[idx] {
+					errCh <- fmt.Errorf("Hash for name %q was %q, but should be %q", names[idx], h, hashes[idx])
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		b.Fatal(err.Error())
+	default:
+	}
 }

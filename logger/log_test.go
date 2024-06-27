@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,8 +24,6 @@ import (
 	"strings"
 	"testing"
 )
-
-var tempRoot = filepath.Join(os.TempDir(), "nats-server")
 
 func TestStdLogger(t *testing.T) {
 	logger := NewStdLogger(false, false, false, false, false)
@@ -105,9 +102,7 @@ func TestStdLoggerTraceWithOutDebug(t *testing.T) {
 }
 
 func TestFileLogger(t *testing.T) {
-	tmpDir := createDir(t, "_nats-server")
-	defer removeDir(t, tmpDir)
-
+	tmpDir := t.TempDir()
 	file := createFileAtDir(t, tmpDir, "nats-server:log_")
 	file.Close()
 
@@ -115,7 +110,7 @@ func TestFileLogger(t *testing.T) {
 	defer logger.Close()
 	logger.Noticef("foo")
 
-	buf, err := ioutil.ReadFile(file.Name())
+	buf, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Could not read logfile: %v", err)
 	}
@@ -130,11 +125,11 @@ func TestFileLogger(t *testing.T) {
 	file = createFileAtDir(t, tmpDir, "nats-server:log_")
 	file.Close()
 
-	logger = NewFileLogger(file.Name(), true, true, true, true)
+	logger = NewFileLogger(file.Name(), true, false, true, true)
 	defer logger.Close()
 	logger.Errorf("foo")
 
-	buf, err = ioutil.ReadFile(file.Name())
+	buf, err = os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Could not read logfile: %v", err)
 	}
@@ -177,8 +172,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 	}
 	logger.Close()
 
-	tmpDir := createDir(t, "nats-server")
-	defer removeDir(t, tmpDir)
+	tmpDir := t.TempDir()
 
 	file := createFileAtDir(t, tmpDir, "log_")
 	file.Close()
@@ -191,7 +185,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 		logger.Noticef("This is a line in the log file")
 	}
 
-	files, err := ioutil.ReadDir(tmpDir)
+	files, err := os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatalf("Error reading logs dir: %v", err)
 	}
@@ -202,7 +196,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 	if err := logger.Close(); err != nil {
 		t.Fatalf("Error closing log: %v", err)
 	}
-	content, err := ioutil.ReadFile(file.Name())
+	content, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Error loading latest log: %v", err)
 	}
@@ -211,10 +205,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 		t.Fatalf("Should be statement about rotated log and backup name, got %s", content)
 	}
 
-	// Remove all files
-	removeDir(t, tmpDir)
-	tmpDir = createDir(t, "nats-server")
-	defer removeDir(t, tmpDir)
+	tmpDir = t.TempDir()
 
 	// Recreate logger and don't set a limit
 	file = createFileAtDir(t, tmpDir, "log_")
@@ -224,7 +215,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		logger.Noticef("This is line %d in the log file", i+1)
 	}
-	files, err = ioutil.ReadDir(tmpDir)
+	files, err = os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatalf("Error reading logs dir: %v", err)
 	}
@@ -235,7 +226,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 	// Now set a limit that is below current size
 	logger.SetSizeLimit(1000)
 	// Should have triggered rotation
-	files, err = ioutil.ReadDir(tmpDir)
+	files, err = os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatalf("Error reading logs dir: %v", err)
 	}
@@ -246,7 +237,7 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 		t.Fatalf("Error closing log: %v", err)
 	}
 	lastBackup = files[len(files)-1]
-	content, err = ioutil.ReadFile(file.Name())
+	content, err = os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Error loading latest log: %v", err)
 	}
@@ -277,12 +268,12 @@ func TestFileLoggerSizeLimit(t *testing.T) {
 	// Close
 	logger.Close()
 
-	files, err = ioutil.ReadDir(tmpDir)
+	files, err = os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatalf("Error reading logs dir: %v", err)
 	}
 	lastBackup = files[len(files)-1]
-	content, err = ioutil.ReadFile(filepath.Join(tmpDir, lastBackup.Name()))
+	content, err = os.ReadFile(filepath.Join(tmpDir, lastBackup.Name()))
 	if err != nil {
 		t.Fatalf("Error reading backup file: %v", err)
 	}
@@ -326,30 +317,11 @@ func expectOutput(t *testing.T, f func(), expected string) {
 	}
 }
 
-func createDir(t *testing.T, prefix string) string {
-	t.Helper()
-	if err := os.MkdirAll(tempRoot, 0700); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := ioutil.TempDir(tempRoot, prefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return dir
-}
-
 func createFileAtDir(t *testing.T, dir, prefix string) *os.File {
 	t.Helper()
-	f, err := ioutil.TempFile(dir, prefix)
+	f, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return f
-}
-
-func removeDir(t *testing.T, dir string) {
-	t.Helper()
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
 }

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,8 +31,10 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/nats-io/nats-server/v2/internal/ocsp"
 	"github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats.go"
+	"golang.org/x/crypto/ocsp"
 )
 
 func init() {
@@ -139,6 +142,64 @@ func checkForAccountNoInterest(t *testing.T, c *client, account string, expected
 		}
 		if ei != nil {
 			return fmt.Errorf("Account %q should have a global no-interest, not subject no-interest", account)
+		}
+		return nil
+	})
+}
+
+func checkGWInterestOnlyMode(t *testing.T, s *Server, outboundGWName, accName string) {
+	t.Helper()
+	checkGWInterestOnlyModeOrNotPresent(t, s, outboundGWName, accName, false)
+}
+
+func checkGWInterestOnlyModeOrNotPresent(t *testing.T, s *Server, outboundGWName, accName string, notPresentOk bool) {
+	t.Helper()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		gwc := s.getOutboundGatewayConnection(outboundGWName)
+		if gwc == nil {
+			return fmt.Errorf("No outbound gateway connection %q for server %v", outboundGWName, s)
+		}
+		gwc.mu.Lock()
+		defer gwc.mu.Unlock()
+		out, ok := gwc.gw.outsim.Load(accName)
+		if !ok {
+			if notPresentOk {
+				return nil
+			} else {
+				return fmt.Errorf("Server %v - outbound gateway connection %q: no account %q found in map",
+					s, outboundGWName, accName)
+			}
+		}
+		if out == nil {
+			return fmt.Errorf("Server %v - outbound gateway connection %q: interest map not found for account %q",
+				s, outboundGWName, accName)
+		}
+		e := out.(*outsie)
+		e.RLock()
+		defer e.RUnlock()
+		if e.mode != InterestOnly {
+			return fmt.Errorf(
+				"Server %v - outbound gateway connection %q: account %q mode shoule be InterestOnly but is %v",
+				s, outboundGWName, accName, e.mode)
+		}
+		return nil
+	})
+}
+
+func checkGWInterestOnlyModeInterestOn(t *testing.T, s *Server, outboundGWName, accName, subject string) {
+	t.Helper()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		c := s.getOutboundGatewayConnection(outboundGWName)
+		outsiei, _ := c.gw.outsim.Load(accName)
+		if outsiei == nil {
+			return fmt.Errorf("Server %s - outbound gateway connection %q: no map entry found for account %q",
+				s, outboundGWName, accName)
+		}
+		outsie := outsiei.(*outsie)
+		r := outsie.sl.Match(subject)
+		if len(r.psubs) == 0 {
+			return fmt.Errorf("Server %s - outbound gateway connection %q - account %q: no subject interest for %q",
+				s, outboundGWName, accName, subject)
 		}
 		return nil
 	})
@@ -510,6 +571,8 @@ func TestGatewayHeaderSupport(t *testing.T) {
 
 	// s1 should have an outbound gateway to s2.
 	waitForOutboundGateways(t, s1, 1, time.Second)
+	// and an inbound too
+	waitForInboundGateways(t, s1, 1, time.Second)
 	// s2 should have an inbound gateway
 	waitForInboundGateways(t, s2, 1, time.Second)
 	// and an outbound too
@@ -526,6 +589,9 @@ func TestGatewayHeaderSupport(t *testing.T) {
 	if _, err := cr.ReadString('\n'); err != nil {
 		t.Fatalf("Error receiving msg from server: %v\n", err)
 	}
+
+	// Wait for interest to be registered on s2
+	checkGWInterestOnlyModeInterestOn(t, s2, "A", globalAccountName, "foo")
 
 	b, _, _ := newClientForServer(s2)
 	defer b.close()
@@ -575,6 +641,8 @@ func TestGatewayHeaderDeliverStrippedMsg(t *testing.T) {
 
 	// s1 should have an outbound gateway to s2.
 	waitForOutboundGateways(t, s1, 1, time.Second)
+	// and an inbound too
+	waitForInboundGateways(t, s1, 1, time.Second)
 	// s2 should have an inbound gateway
 	waitForInboundGateways(t, s2, 1, time.Second)
 	// and an outbound too
@@ -591,6 +659,9 @@ func TestGatewayHeaderDeliverStrippedMsg(t *testing.T) {
 	if _, err := cr.ReadString('\n'); err != nil {
 		t.Fatalf("Error receiving msg from server: %v\n", err)
 	}
+
+	// Wait for interest to be registered on s2
+	checkGWInterestOnlyModeInterestOn(t, s2, "A", globalAccountName, "foo")
 
 	b, _, _ := newClientForServer(s2)
 	defer b.close()
@@ -1307,7 +1378,7 @@ type gwReconnAttemptLogger struct {
 	errCh chan string
 }
 
-func (l *gwReconnAttemptLogger) Errorf(format string, v ...interface{}) {
+func (l *gwReconnAttemptLogger) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, `Error connecting to implicit gateway "A"`) {
 		select {
@@ -1666,6 +1737,9 @@ func setAccountUserPassInOptions(o *Options, accName, username, password string)
 }
 
 func TestGatewayAccountInterest(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	o2 := testDefaultOptionsForGateway("B")
 	// Add users to cause s2 to require auth. Will add an account with user later.
 	o2.Users = append([]*User(nil), &User{Username: "test", Password: "pwd"})
@@ -1841,6 +1915,9 @@ func TestGatewayAccountUnsub(t *testing.T) {
 }
 
 func TestGatewaySubjectInterest(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	o1 := testDefaultOptionsForGateway("A")
 	setAccountUserPassInOptions(o1, "$foo", "ivan", "password")
 	s1 := runGatewayServer(o1)
@@ -2497,6 +2574,9 @@ func TestGatewaySendQSubsOnGatewayConnect(t *testing.T) {
 }
 
 func TestGatewaySendRemoteQSubs(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	ob1 := testDefaultOptionsForGateway("B")
 	sb1 := runGatewayServer(ob1)
 	defer sb1.Shutdown()
@@ -2943,7 +3023,7 @@ type checkErrorLogger struct {
 	gotError      bool
 }
 
-func (l *checkErrorLogger) Errorf(format string, args ...interface{}) {
+func (l *checkErrorLogger) Errorf(format string, args ...any) {
 	l.DummyLogger.Errorf(format, args...)
 	l.Lock()
 	if strings.Contains(l.Msg, l.checkErrorStr) {
@@ -2965,6 +3045,7 @@ func TestGatewayRoutedServerWithoutGatewayConfigured(t *testing.T) {
 	waitForOutboundGateways(t, s2, 1, time.Second)
 
 	o3 := DefaultOptions()
+	o3.NoSystemAccount = true
 	o3.Cluster.Name = "B"
 	o3.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", s2.ClusterAddr().Port))
 	s3 := New(o3)
@@ -3082,9 +3163,8 @@ func TestGatewayUnknownGatewayCommand(t *testing.T) {
 
 	var route *client
 	s2.mu.Lock()
-	for _, r := range s2.routes {
+	if r := getFirstRoute(s2); r != nil {
 		route = r
-		break
 	}
 	s2.mu.Unlock()
 
@@ -3274,13 +3354,21 @@ func getInboundGatewayConnection(s *Server, name string) *client {
 	var gwsa [4]*client
 	var gws = gwsa[:0]
 	s.getInboundGatewayConnections(&gws)
-	if len(gws) > 0 {
-		return gws[0]
+	for _, gw := range gws {
+		gw.mu.Lock()
+		ok := gw.gw.name == name
+		gw.mu.Unlock()
+		if ok {
+			return gw
+		}
 	}
 	return nil
 }
 
 func TestGatewaySendAllSubs(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	gatewayMaxRUnsubBeforeSwitch = 100
 	defer func() { gatewayMaxRUnsubBeforeSwitch = defaultGatewayMaxRUnsubBeforeSwitch }()
 
@@ -3392,21 +3480,9 @@ func TestGatewaySendAllSubs(t *testing.T) {
 		if !switchedMode {
 			return fmt.Errorf("C has still not switched mode")
 		}
-		switchedMode = false
-		// Now check B outbound connection to C
-		c = sb.getOutboundGatewayConnection("C")
-		ei, _ := c.gw.outsim.Load(globalAccountName)
-		if ei != nil {
-			e := ei.(*outsie)
-			e.RLock()
-			switchedMode = e.ni == nil && e.mode == InterestOnly
-			e.RUnlock()
-		}
-		if !switchedMode {
-			return fmt.Errorf("C has still not switched mode")
-		}
 		return nil
 	})
+	checkGWInterestOnlyMode(t, sb, "C", globalAccountName)
 	wg.Wait()
 
 	// Check consCount and accsCount on C
@@ -3484,7 +3560,7 @@ func TestGatewaySendAllSubsBadProtocol(t *testing.T) {
 	// For this test, make sure to use inbound from A so
 	// A will reconnect when we send bad proto that
 	// causes connection to be closed.
-	c := getInboundGatewayConnection(sa, "A")
+	c := getInboundGatewayConnection(sa, "B")
 	// Mock an invalid protocol (account name missing)
 	info := &Info{
 		Gateway:    "B",
@@ -3497,7 +3573,7 @@ func TestGatewaySendAllSubsBadProtocol(t *testing.T) {
 
 	orgConn := c
 	checkFor(t, 3*time.Second, 100*time.Millisecond, func() error {
-		curConn := getInboundGatewayConnection(sa, "A")
+		curConn := getInboundGatewayConnection(sa, "B")
 		if orgConn == curConn {
 			return fmt.Errorf("Not reconnected")
 		}
@@ -3510,7 +3586,7 @@ func TestGatewaySendAllSubsBadProtocol(t *testing.T) {
 	// Refresh
 	c = nil
 	checkFor(t, 3*time.Second, 15*time.Millisecond, func() error {
-		c = getInboundGatewayConnection(sa, "A")
+		c = getInboundGatewayConnection(sa, "B")
 		if c == nil {
 			return fmt.Errorf("Did not reconnect")
 		}
@@ -3532,7 +3608,7 @@ func TestGatewaySendAllSubsBadProtocol(t *testing.T) {
 
 	orgConn = c
 	checkFor(t, 3*time.Second, 100*time.Millisecond, func() error {
-		curConn := getInboundGatewayConnection(sa, "A")
+		curConn := getInboundGatewayConnection(sa, "B")
 		if orgConn == curConn {
 			return fmt.Errorf("Not reconnected")
 		}
@@ -3556,6 +3632,7 @@ func TestGatewayRaceOnClose(t *testing.T) {
 
 	bURL := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
 	ncB := natsConnect(t, bURL, nats.NoReconnect())
+	defer ncB.Close()
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
@@ -3582,6 +3659,9 @@ func TestGatewayRaceOnClose(t *testing.T) {
 // Similar to TestNewRoutesServiceImport but with 2 GW servers instead
 // of a cluster of 2 servers.
 func TestGatewayServiceImport(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	oa := testDefaultOptionsForGateway("A")
 	setAccountUserPassInOptions(oa, "$foo", "clientA", "password")
 	setAccountUserPassInOptions(oa, "$bar", "yyyyyyy", "password")
@@ -3809,21 +3889,7 @@ func TestGatewayServiceImport(t *testing.T) {
 	}
 	natsFlush(t, clientB)
 
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		c := sb.getOutboundGatewayConnection("A")
-		outsiei, _ := c.gw.outsim.Load("$foo")
-		if outsiei == nil {
-			return fmt.Errorf("Nothing found for $foo")
-		}
-		outsie := outsiei.(*outsie)
-		outsie.RLock()
-		mode := outsie.mode
-		outsie.RUnlock()
-		if mode != InterestOnly {
-			return fmt.Errorf("Should have switched to interest only mode")
-		}
-		return nil
-	})
+	checkGWInterestOnlyMode(t, sb, "A", "$foo")
 
 	// Go back to clientB on $bar.
 	clientB.Close()
@@ -3839,19 +3905,7 @@ func TestGatewayServiceImport(t *testing.T) {
 
 	// Sine it is interest-only, B should receive an interest
 	// on $foo test.request
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		c := sb.getOutboundGatewayConnection("A")
-		outsiei, _ := c.gw.outsim.Load("$foo")
-		if outsiei == nil {
-			return fmt.Errorf("Nothing found for $foo")
-		}
-		outsie := outsiei.(*outsie)
-		r := outsie.sl.Match("test.request")
-		if len(r.psubs) != 1 {
-			return fmt.Errorf("No registered interest on test.request")
-		}
-		return nil
-	})
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", "$foo", "test.request")
 
 	// Send the request from clientB on foo.request,
 	natsPubReq(t, clientB, "foo.request", "reply", []byte("hi"))
@@ -3893,6 +3947,9 @@ func TestGatewayServiceImport(t *testing.T) {
 }
 
 func TestGatewayServiceImportWithQueue(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	oa := testDefaultOptionsForGateway("A")
 	setAccountUserPassInOptions(oa, "$foo", "clientA", "password")
 	setAccountUserPassInOptions(oa, "$bar", "yyyyyyy", "password")
@@ -4124,21 +4181,7 @@ func TestGatewayServiceImportWithQueue(t *testing.T) {
 	}
 	natsFlush(t, clientB)
 
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		c := sb.getOutboundGatewayConnection("A")
-		outsiei, _ := c.gw.outsim.Load("$foo")
-		if outsiei == nil {
-			return fmt.Errorf("Nothing found for $foo")
-		}
-		outsie := outsiei.(*outsie)
-		outsie.RLock()
-		mode := outsie.mode
-		outsie.RUnlock()
-		if mode != InterestOnly {
-			return fmt.Errorf("Should have switched to interest only mode")
-		}
-		return nil
-	})
+	checkGWInterestOnlyMode(t, sb, "A", "$foo")
 
 	// Go back to clientB on $bar.
 	clientB.Close()
@@ -4154,19 +4197,7 @@ func TestGatewayServiceImportWithQueue(t *testing.T) {
 
 	// Sine it is interest-only, B should receive an interest
 	// on $foo test.request
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		c := sb.getOutboundGatewayConnection("A")
-		outsiei, _ := c.gw.outsim.Load("$foo")
-		if outsiei == nil {
-			return fmt.Errorf("Nothing found for $foo")
-		}
-		outsie := outsiei.(*outsie)
-		r := outsie.sl.Match("test.request")
-		if len(r.psubs) != 1 {
-			return fmt.Errorf("No registered interest on test.request")
-		}
-		return nil
-	})
+	checkGWInterestOnlyModeInterestOn(t, sb, "A", "$foo", "test.request")
 
 	// Send the request from clientB on foo.request,
 	natsPubReq(t, clientB, "foo.request", "reply", []byte("hi"))
@@ -4326,7 +4357,7 @@ func TestGatewayServiceImportComplexSetup(t *testing.T) {
 	if c == nil || c.opts.Name != sb2.ID() {
 		t.Fatalf("A2 does not have outbound to B2")
 	}
-	c = getInboundGatewayConnection(sa2, "A")
+	c = getInboundGatewayConnection(sa2, "B")
 	if c != nil {
 		t.Fatalf("Bad setup")
 	}
@@ -4334,7 +4365,7 @@ func TestGatewayServiceImportComplexSetup(t *testing.T) {
 	if c == nil || c.opts.Name != sa1.ID() {
 		t.Fatalf("B2 does not have outbound to A1")
 	}
-	c = getInboundGatewayConnection(sb2, "B")
+	c = getInboundGatewayConnection(sb2, "A")
 	if c == nil || c.opts.Name != sa2.ID() {
 		t.Fatalf("Bad setup")
 	}
@@ -4517,24 +4548,7 @@ func TestGatewayServiceImportComplexSetup(t *testing.T) {
 	}
 	natsFlush(t, clientA)
 	// Wait for B2 to switch to interest-only
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		c := sa2.getOutboundGatewayConnection("B")
-		if c == nil {
-			return fmt.Errorf("No outbound to B2")
-		}
-		outsiei, _ := c.gw.outsim.Load("$foo")
-		if outsiei == nil {
-			return fmt.Errorf("Nothing for $foo")
-		}
-		outsie := outsiei.(*outsie)
-		outsie.RLock()
-		mode := outsie.mode
-		outsie.RUnlock()
-		if mode != InterestOnly {
-			return fmt.Errorf("Not in interest-only mode yet")
-		}
-		return nil
-	})
+	checkGWInterestOnlyMode(t, sa2, "B", "$foo")
 
 	subA = natsSubSync(t, clientA, "test.request")
 	natsFlush(t, clientA)
@@ -4685,7 +4699,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			if c == nil || c.opts.Name != sb2.ID() {
 				t.Fatalf("A2 does not have outbound to B2")
 			}
-			c = getInboundGatewayConnection(sa2, "A")
+			c = getInboundGatewayConnection(sa2, "B")
 			if c != nil {
 				t.Fatalf("Bad setup")
 			}
@@ -4693,7 +4707,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			if c == nil || c.opts.Name != sa1.ID() {
 				t.Fatalf("B2 does not have outbound to A1")
 			}
-			c = getInboundGatewayConnection(sb2, "B")
+			c = getInboundGatewayConnection(sb2, "A")
 			if c == nil || c.opts.Name != sa2.ID() {
 				t.Fatalf("Bad setup")
 			}
@@ -4890,24 +4904,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			natsFlush(t, clientA)
 
 			// Wait for B2 to switch to interest-only
-			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-				c := sa2.getOutboundGatewayConnection("B")
-				if c == nil {
-					return fmt.Errorf("No outbound to B2")
-				}
-				outsiei, _ := c.gw.outsim.Load("$foo")
-				if outsiei == nil {
-					return fmt.Errorf("Nothing for $foo")
-				}
-				outsie := outsiei.(*outsie)
-				outsie.RLock()
-				mode := outsie.mode
-				outsie.RUnlock()
-				if mode != InterestOnly {
-					return fmt.Errorf("Not in interest-only mode yet")
-				}
-				return nil
-			})
+			checkGWInterestOnlyMode(t, sa2, "B", "$foo")
 
 			subA = natsSubSync(t, clientA, "ngs.update.*")
 			natsFlush(t, clientA)
@@ -5105,141 +5102,180 @@ func (c *delayedWriteConn) Write(b []byte) (int, error) {
 // there, but also to subscribers on that reply subject
 // on the other cluster.
 func TestGatewaySendReplyAcrossGateways(t *testing.T) {
-	ob := testDefaultOptionsForGateway("B")
-	ob.Accounts = []*Account{NewAccount("ACC")}
-	ob.Users = []*User{{Username: "user", Password: "pwd", Account: ob.Accounts[0]}}
-	sb := runGatewayServer(ob)
-	defer sb.Shutdown()
+	for _, test := range []struct {
+		name     string
+		poolSize int
+		peracc   bool
+	}{
+		{"no pooling", -1, false},
+		{"pooling", 5, false},
+		{"per account", 0, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ob := testDefaultOptionsForGateway("B")
+			ob.Accounts = []*Account{NewAccount("ACC")}
+			ob.Users = []*User{{Username: "user", Password: "pwd", Account: ob.Accounts[0]}}
+			sb := runGatewayServer(ob)
+			defer sb.Shutdown()
 
-	oa1 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
-	oa1.Accounts = []*Account{NewAccount("ACC")}
-	oa1.Users = []*User{{Username: "user", Password: "pwd", Account: oa1.Accounts[0]}}
-	sa1 := runGatewayServer(oa1)
-	defer sa1.Shutdown()
-
-	waitForOutboundGateways(t, sb, 1, time.Second)
-	waitForInboundGateways(t, sb, 1, time.Second)
-	waitForOutboundGateways(t, sa1, 1, time.Second)
-	waitForInboundGateways(t, sa1, 1, time.Second)
-
-	// Now start another server in cluster "A". This will allow us
-	// to test the reply from cluster "B" coming back directly to
-	// the server where the request originates, and indirectly through
-	// route.
-	oa2 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
-	oa2.Accounts = []*Account{NewAccount("ACC")}
-	oa2.Users = []*User{{Username: "user", Password: "pwd", Account: oa2.Accounts[0]}}
-	oa2.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", oa1.Cluster.Host, oa1.Cluster.Port))
-	sa2 := runGatewayServer(oa2)
-	defer sa2.Shutdown()
-
-	waitForOutboundGateways(t, sa2, 1, time.Second)
-	waitForInboundGateways(t, sb, 2, time.Second)
-	checkClusterFormed(t, sa1, sa2)
-
-	replySubj := "bar"
-
-	// Setup a responder on sb
-	ncb := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", ob.Host, ob.Port))
-	defer ncb.Close()
-	natsSub(t, ncb, "foo", func(m *nats.Msg) {
-		m.Respond([]byte("reply"))
-	})
-	// Set a subscription on the reply subject on sb
-	subSB := natsSubSync(t, ncb, replySubj)
-	natsFlush(t, ncb)
-	checkExpectedSubs(t, 2, sb)
-
-	testReqReply := func(t *testing.T, host string, port int, createSubOnA bool) {
-		t.Helper()
-		nca := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", host, port))
-		defer nca.Close()
-		if createSubOnA {
-			subSA := natsSubSync(t, nca, replySubj)
-			natsPubReq(t, nca, "foo", replySubj, []byte("hello"))
-			natsNexMsg(t, subSA, time.Second)
-			// Check for duplicates
-			if _, err := subSA.NextMsg(50 * time.Millisecond); err == nil {
-				t.Fatalf("Received duplicate message on subSA!")
+			oa1 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+			oa1.Cluster.PoolSize = test.poolSize
+			if test.peracc {
+				oa1.Cluster.PinnedAccounts = []string{"ACC"}
 			}
-		} else {
-			natsPubReq(t, nca, "foo", replySubj, []byte("hello"))
-		}
-		natsNexMsg(t, subSB, time.Second)
-		// Check for duplicates
-		if _, err := subSB.NextMsg(50 * time.Millisecond); err == nil {
-			t.Fatalf("Received duplicate message on subSB!")
-		}
+			oa1.Accounts = []*Account{NewAccount("ACC")}
+			oa1.Users = []*User{{Username: "user", Password: "pwd", Account: oa1.Accounts[0]}}
+			sa1 := runGatewayServer(oa1)
+			defer sa1.Shutdown()
+
+			waitForOutboundGateways(t, sb, 1, time.Second)
+			waitForInboundGateways(t, sb, 1, time.Second)
+			waitForOutboundGateways(t, sa1, 1, time.Second)
+			waitForInboundGateways(t, sa1, 1, time.Second)
+
+			// Now start another server in cluster "A". This will allow us
+			// to test the reply from cluster "B" coming back directly to
+			// the server where the request originates, and indirectly through
+			// route.
+			oa2 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+			oa2.Cluster.PoolSize = test.poolSize
+			if test.peracc {
+				oa2.Cluster.PinnedAccounts = []string{"ACC"}
+			}
+			oa2.Accounts = []*Account{NewAccount("ACC")}
+			oa2.Users = []*User{{Username: "user", Password: "pwd", Account: oa2.Accounts[0]}}
+			oa2.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", oa1.Cluster.Host, oa1.Cluster.Port))
+			sa2 := runGatewayServer(oa2)
+			defer sa2.Shutdown()
+
+			waitForOutboundGateways(t, sa2, 1, time.Second)
+			waitForInboundGateways(t, sb, 2, time.Second)
+			checkClusterFormed(t, sa1, sa2)
+
+			replySubj := "bar"
+
+			// Setup a responder on sb
+			ncb := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", ob.Host, ob.Port))
+			defer ncb.Close()
+			natsSub(t, ncb, "foo", func(m *nats.Msg) {
+				m.Respond([]byte("reply"))
+			})
+			// Set a subscription on the reply subject on sb
+			subSB := natsSubSync(t, ncb, replySubj)
+			natsFlush(t, ncb)
+			checkExpectedSubs(t, 2, sb)
+
+			testReqReply := func(t *testing.T, host string, port int, createSubOnA bool) {
+				t.Helper()
+				nca := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", host, port))
+				defer nca.Close()
+				if createSubOnA {
+					subSA := natsSubSync(t, nca, replySubj)
+					natsPubReq(t, nca, "foo", replySubj, []byte("hello"))
+					natsNexMsg(t, subSA, time.Second)
+					// Check for duplicates
+					if _, err := subSA.NextMsg(50 * time.Millisecond); err == nil {
+						t.Fatalf("Received duplicate message on subSA!")
+					}
+				} else {
+					natsPubReq(t, nca, "foo", replySubj, []byte("hello"))
+				}
+				natsNexMsg(t, subSB, time.Second)
+				// Check for duplicates
+				if _, err := subSB.NextMsg(50 * time.Millisecond); err == nil {
+					t.Fatalf("Received duplicate message on subSB!")
+				}
+			}
+			// Create requestor on sa1 to check for direct reply from GW:
+			testReqReply(t, oa1.Host, oa1.Port, true)
+			// Wait for subscription to be gone...
+			checkExpectedSubs(t, 0, sa1)
+			// Now create requestor on sa2, it will receive reply through sa1.
+			testReqReply(t, oa2.Host, oa2.Port, true)
+			checkExpectedSubs(t, 0, sa1)
+			checkExpectedSubs(t, 0, sa2)
+
+			// Now issue requests but without any interest in the requestor's
+			// origin cluster and make sure the other cluster gets the reply.
+			testReqReply(t, oa1.Host, oa1.Port, false)
+			testReqReply(t, oa2.Host, oa2.Port, false)
+
+			// There is a possible race between sa2 sending the RS+ for the
+			// subscription on the reply subject, and the GW reply making it
+			// to sa1 before the RS+ is processed there.
+			// We are going to force this race by making the route connection
+			// block as needed.
+
+			acc, _ := sa2.LookupAccount("ACC")
+			acc.mu.RLock()
+			api := acc.routePoolIdx
+			acc.mu.RUnlock()
+
+			var route *client
+			sa2.mu.Lock()
+			if test.peracc {
+				if conns, ok := sa2.accRoutes["ACC"]; ok {
+					for _, r := range conns {
+						route = r
+						break
+					}
+				}
+			} else if test.poolSize > 0 {
+				sa2.forEachRoute(func(r *client) {
+					r.mu.Lock()
+					if r.route.poolIdx == api {
+						route = r
+					}
+					r.mu.Unlock()
+				})
+			} else if r := getFirstRoute(sa2); r != nil {
+				route = r
+			}
+			sa2.mu.Unlock()
+			route.mu.Lock()
+			routeConn := &delayedWriteConn{
+				Conn: route.nc,
+				wg:   sync.WaitGroup{},
+			}
+			route.nc = routeConn
+			route.mu.Unlock()
+
+			delayRoute := func() {
+				routeConn.Lock()
+				routeConn.delay = true
+				routeConn.Unlock()
+			}
+			stopDelayRoute := func() {
+				routeConn.Lock()
+				routeConn.delay = false
+				wg := &routeConn.wg
+				routeConn.Unlock()
+				wg.Wait()
+			}
+
+			delayRoute()
+			testReqReply(t, oa2.Host, oa2.Port, true)
+			stopDelayRoute()
+
+			// Same test but now we have a local interest on the reply subject
+			// on sa1 to make sure that interest there does not prevent sending
+			// the RMSG to sa2, which is the origin of the request.
+			checkExpectedSubs(t, 0, sa1)
+			checkExpectedSubs(t, 0, sa2)
+			nca1 := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", oa1.Host, oa1.Port))
+			defer nca1.Close()
+			subSA1 := natsSubSync(t, nca1, replySubj)
+			natsFlush(t, nca1)
+			checkExpectedSubs(t, 1, sa1)
+			checkExpectedSubs(t, 1, sa2)
+
+			delayRoute()
+			testReqReply(t, oa2.Host, oa2.Port, true)
+			stopDelayRoute()
+
+			natsNexMsg(t, subSA1, time.Second)
+		})
 	}
-	// Create requestor on sa1 to check for direct reply from GW:
-	testReqReply(t, oa1.Host, oa1.Port, true)
-	// Wait for subscription to be gone...
-	checkExpectedSubs(t, 0, sa1)
-	// Now create requestor on sa2, it will receive reply through sa1.
-	testReqReply(t, oa2.Host, oa2.Port, true)
-	checkExpectedSubs(t, 0, sa1)
-	checkExpectedSubs(t, 0, sa2)
-
-	// Now issue requests but without any interest in the requestor's
-	// origin cluster and make sure the other cluster gets the reply.
-	testReqReply(t, oa1.Host, oa1.Port, false)
-	testReqReply(t, oa2.Host, oa2.Port, false)
-
-	// There is a possible race between sa2 sending the RS+ for the
-	// subscription on the reply subject, and the GW reply making it
-	// to sa1 before the RS+ is processed there.
-	// We are going to force this race by making the route connection
-	// block as needed.
-
-	var route *client
-	sa2.mu.Lock()
-	for _, r := range sa2.routes {
-		route = r
-		break
-	}
-	sa2.mu.Unlock()
-	route.mu.Lock()
-	routeConn := &delayedWriteConn{
-		Conn: route.nc,
-		wg:   sync.WaitGroup{},
-	}
-	route.nc = routeConn
-	route.mu.Unlock()
-
-	delayRoute := func() {
-		routeConn.Lock()
-		routeConn.delay = true
-		routeConn.Unlock()
-	}
-	stopDelayRoute := func() {
-		routeConn.Lock()
-		routeConn.delay = false
-		wg := &routeConn.wg
-		routeConn.Unlock()
-		wg.Wait()
-	}
-
-	delayRoute()
-	testReqReply(t, oa2.Host, oa2.Port, true)
-	stopDelayRoute()
-
-	// Same test but now we have a local interest on the reply subject
-	// on sa1 to make sure that interest there does not prevent sending
-	// the RMSG to sa2, which is the origin of the request.
-	checkExpectedSubs(t, 0, sa1)
-	checkExpectedSubs(t, 0, sa2)
-	nca1 := natsConnect(t, fmt.Sprintf("nats://user:pwd@%s:%d", oa1.Host, oa1.Port))
-	defer nca1.Close()
-	subSA1 := natsSubSync(t, nca1, replySubj)
-	natsFlush(t, nca1)
-	checkExpectedSubs(t, 1, sa1)
-	checkExpectedSubs(t, 1, sa2)
-
-	delayRoute()
-	testReqReply(t, oa2.Host, oa2.Port, true)
-	stopDelayRoute()
-
-	natsNexMsg(t, subSA1, time.Second)
 }
 
 // This test will have a requestor on cluster A and responder
@@ -5327,6 +5363,7 @@ func TestGatewaySendReplyAcrossGatewaysServiceImport(t *testing.T) {
 	defer sb.Shutdown()
 
 	oa1 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa1.Cluster.PoolSize = 1
 	setAccountUserPassInOptions(oa1, "$foo", "clientAFoo", "password")
 	setAccountUserPassInOptions(oa1, "$bar", "clientABar", "password")
 	sa1 := runGatewayServer(oa1)
@@ -5338,6 +5375,7 @@ func TestGatewaySendReplyAcrossGatewaysServiceImport(t *testing.T) {
 	waitForInboundGateways(t, sa1, 1, time.Second)
 
 	oa2 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa2.Cluster.PoolSize = 1
 	setAccountUserPassInOptions(oa2, "$foo", "clientAFoo", "password")
 	setAccountUserPassInOptions(oa2, "$bar", "clientABar", "password")
 	oa2.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", oa1.Cluster.Host, oa1.Cluster.Port))
@@ -5345,6 +5383,7 @@ func TestGatewaySendReplyAcrossGatewaysServiceImport(t *testing.T) {
 	defer sa2.Shutdown()
 
 	oa3 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	oa3.Cluster.PoolSize = 1
 	setAccountUserPassInOptions(oa3, "$foo", "clientAFoo", "password")
 	setAccountUserPassInOptions(oa3, "$bar", "clientABar", "password")
 	oa3.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", oa1.Cluster.Host, oa1.Cluster.Port))
@@ -5450,24 +5489,24 @@ func TestGatewaySendReplyAcrossGatewaysServiceImport(t *testing.T) {
 	testServiceImport(t, oa1.Host, oa1.Port)
 	testServiceImport(t, oa2.Host, oa2.Port)
 	// sa1 is the one receiving the reply from GW between B and A.
-	// Check that the server routes directly to the the server
+	// Check that the server routes directly to the server
 	// with the interest.
 	checkRoute := func(t *testing.T, s *Server, expected int64) {
 		t.Helper()
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		for _, r := range s.routes {
+		s.forEachRoute(func(r *client) {
 			r.mu.Lock()
 			if r.route.remoteID != sa1.ID() {
 				r.mu.Unlock()
-				continue
+				return
 			}
 			inMsgs := atomic.LoadInt64(&r.inMsgs)
 			r.mu.Unlock()
 			if inMsgs != expected {
 				t.Fatalf("Expected %v incoming msgs, got %v", expected, inMsgs)
 			}
-		}
+		})
 	}
 	// Wait a bit to make sure that we don't have a loop that
 	// cause messages to be routed more than needed.
@@ -5541,6 +5580,9 @@ func TestGatewayClientsDontReceiveMsgsOnGWPrefix(t *testing.T) {
 }
 
 func TestGatewayNoAccInterestThenQSubThenRegularSub(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	ob := testDefaultOptionsForGateway("B")
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
@@ -5600,6 +5642,9 @@ func TestGatewayNoAccInterestThenQSubThenRegularSub(t *testing.T) {
 // Similar to TestGatewayNoAccInterestThenQSubThenRegularSub but simulate
 // older incorrect behavior.
 func TestGatewayHandleUnexpectedASubUnsub(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	ob := testDefaultOptionsForGateway("B")
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
@@ -5724,7 +5769,7 @@ type captureGWInterestSwitchLogger struct {
 	imss []string
 }
 
-func (l *captureGWInterestSwitchLogger) Debugf(format string, args ...interface{}) {
+func (l *captureGWInterestSwitchLogger) Debugf(format string, args ...any) {
 	l.Lock()
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, fmt.Sprintf("switching account %q to %s mode", globalAccountName, InterestOnly)) ||
@@ -5735,6 +5780,9 @@ func (l *captureGWInterestSwitchLogger) Debugf(format string, args ...interface{
 }
 
 func TestGatewayLogAccountInterestModeSwitch(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	ob := testDefaultOptionsForGateway("B")
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
@@ -5782,21 +5830,7 @@ func TestGatewayLogAccountInterestModeSwitch(t *testing.T) {
 		return nil
 	})
 
-	gwB := sa.getOutboundGatewayConnection("B")
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		ei, ok := gwB.gw.outsim.Load(globalAccountName)
-		if !ok || ei == nil {
-			return fmt.Errorf("not switched yet")
-		}
-		e := ei.(*outsie)
-		e.RLock()
-		mode := e.mode
-		e.RUnlock()
-		if mode != InterestOnly {
-			return fmt.Errorf("not in interest mode only yet")
-		}
-		return nil
-	})
+	checkGWInterestOnlyMode(t, sa, "B", globalAccountName)
 
 	checkLog := func(t *testing.T, l *captureGWInterestSwitchLogger) {
 		t.Helper()
@@ -5835,6 +5869,9 @@ func TestGatewayLogAccountInterestModeSwitch(t *testing.T) {
 }
 
 func TestGatewayAccountInterestModeSwitchOnlyOncePerAccount(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	ob := testDefaultOptionsForGateway("B")
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
@@ -5988,7 +6025,7 @@ func TestGatewayReplyMapTracking(t *testing.T) {
 			t.Fatalf("Client map should have %v entries, got %v", expectLenMap, lenMap)
 		}
 		srvMapEmpty := true
-		sb.gwrm.m.Range(func(_, _ interface{}) bool {
+		sb.gwrm.m.Range(func(_, _ any) bool {
 			srvMapEmpty = false
 			return false
 		})
@@ -6352,7 +6389,6 @@ func TestGatewayTLSConfigReload(t *testing.T) {
 		}
 	`
 	confA := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer removeFile(t, confA)
 
 	srvA, optsA := RunServerWithConfig(confA)
 	defer srvA.Shutdown()
@@ -6405,7 +6441,6 @@ func TestGatewayTLSConfigReloadForRemote(t *testing.T) {
 		}
 	`
 	confB := createConfFile(t, []byte(fmt.Sprintf(template, optsA.Gateway.Port, "")))
-	defer removeFile(t, confB)
 
 	srvB, _ := RunServerWithConfig(confB)
 	defer srvB.Shutdown()
@@ -6432,7 +6467,6 @@ func TestGatewayAuthDiscovered(t *testing.T) {
 			authorization: { user: gwuser, password: changeme }
 		}
 	`))
-	defer removeFile(t, confA)
 	srvA, optsA := RunServerWithConfig(confA)
 	defer srvA.Shutdown()
 
@@ -6447,7 +6481,6 @@ func TestGatewayAuthDiscovered(t *testing.T) {
 			]
 		}
 	`, optsA.Gateway.Port)))
-	defer removeFile(t, confB)
 	srvB, _ := RunServerWithConfig(confB)
 	defer srvB.Shutdown()
 
@@ -6457,18 +6490,17 @@ func TestGatewayAuthDiscovered(t *testing.T) {
 	waitForOutboundGateways(t, srvB, 1, time.Second)
 }
 
-func TestTLSGatewaysCertificateImplicitAllowPass(t *testing.T) {
-	testTLSGatewaysCertificateImplicitAllow(t, true)
+func TestGatewayTLSCertificateImplicitAllowPass(t *testing.T) {
+	testGatewayTLSCertificateImplicitAllow(t, true)
 }
 
-func TestTLSGatewaysCertificateImplicitAllowFail(t *testing.T) {
-	testTLSGatewaysCertificateImplicitAllow(t, false)
+func TestGatewayTLSCertificateImplicitAllowFail(t *testing.T) {
+	testGatewayTLSCertificateImplicitAllow(t, false)
 }
 
-func testTLSGatewaysCertificateImplicitAllow(t *testing.T, pass bool) {
+func testGatewayTLSCertificateImplicitAllow(t *testing.T, pass bool) {
 	// Base config for the servers
-	cfg := createFile(t, "cfg")
-	defer removeFile(t, cfg.Name())
+	cfg := createTempFile(t, "cfg")
 	cfg.WriteString(fmt.Sprintf(`
 		gateway {
 		  tls {
@@ -6714,7 +6746,6 @@ func TestGatewayDuplicateServerName(t *testing.T) {
 	ob3 := testDefaultOptionsForGateway("B")
 	ob3.ServerName = "a_nats2"
 	ob3.Accounts = []*Account{NewAccount("sys")}
-	ob3.SystemAccount = "sys"
 	ob3.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob2.Cluster.Port))
 	sb3 := RunServer(ob3)
 	defer sb3.Shutdown()
@@ -6739,7 +6770,6 @@ func TestGatewayDuplicateServerName(t *testing.T) {
 	oc := testGatewayOptionsFromToWithServers(t, "C", "B", sb1)
 	oc.ServerName = "a_nats2"
 	oc.Accounts = []*Account{NewAccount("sys")}
-	oc.SystemAccount = "sys"
 	sc := RunServer(oc)
 	defer sc.Shutdown()
 	scl := &captureErrorLogger{errCh: make(chan string, 100)}
@@ -6748,4 +6778,634 @@ func TestGatewayDuplicateServerName(t *testing.T) {
 	// It should report the error when trying to create the GW connection
 	// to cluster "A"
 	checkForDupError(scl.errCh)
+}
+
+func TestGatewayNoPanicOnStartupWithMonitoring(t *testing.T) {
+	o := testDefaultOptionsForGateway("B")
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = 8888
+	s, err := NewServer(o)
+	require_NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		time.Sleep(50 * time.Millisecond)
+		s.Start()
+		s.WaitForShutdown()
+	}()
+
+	for {
+		g, err := s.Gatewayz(nil)
+		if err != nil {
+			continue
+		}
+		if g.Port != 0 && g.Port != s.GatewayAddr().Port {
+			t.Fatalf("Unexpected port: %v vs %v", g.Port, s.GatewayAddr().Port)
+		}
+		break
+	}
+	s.Shutdown()
+	wg.Wait()
+}
+
+func TestGatewaySwitchToInterestOnlyModeImmediately(t *testing.T) {
+	o2 := testDefaultOptionsForGateway("B")
+	// Add users to cause s2 to require auth. Will add an account with user later.
+	o2.Users = append([]*User(nil), &User{Username: "test", Password: "pwd"})
+	s2 := runGatewayServer(o2)
+	defer s2.Shutdown()
+
+	o1 := testGatewayOptionsFromToWithServers(t, "A", "B", s2)
+	setAccountUserPassInOptions(o1, "$foo", "ivan", "password")
+	s1 := runGatewayServer(o1)
+	defer s1.Shutdown()
+
+	waitForOutboundGateways(t, s1, 1, time.Second)
+	waitForOutboundGateways(t, s2, 1, time.Second)
+
+	s1Url := fmt.Sprintf("nats://ivan:password@127.0.0.1:%d", o1.Port)
+	nc := natsConnect(t, s1Url)
+	defer nc.Close()
+	natsPub(t, nc, "foo", []byte("hello"))
+	natsFlush(t, nc)
+
+	checkCount := func(t *testing.T, c *client, expected int) {
+		t.Helper()
+		c.mu.Lock()
+		out := c.outMsgs
+		c.mu.Unlock()
+		if int(out) != expected {
+			t.Fatalf("Expected %d message(s) to be sent over, got %v", expected, out)
+		}
+	}
+	// No message should be sent
+	gwcb := s1.getOutboundGatewayConnection("B")
+	checkCount(t, gwcb, 0)
+
+	// Check that we are in interest-only mode, but in this case, since s2 does
+	// have the account, we should have the account not even present in the map.
+	checkGWInterestOnlyModeOrNotPresent(t, s1, "B", "$foo", true)
+
+	// Add account to S2 and a client.
+	s2FooAcc, err := s2.RegisterAccount("$foo")
+	if err != nil {
+		t.Fatalf("Error registering account: %v", err)
+	}
+	s2.mu.Lock()
+	s2.users["ivan"] = &User{Account: s2FooAcc, Username: "ivan", Password: "password"}
+	s2.mu.Unlock()
+	s2Url := fmt.Sprintf("nats://ivan:password@127.0.0.1:%d", o2.Port)
+	ncS2 := natsConnect(t, s2Url)
+	defer ncS2.Close()
+	natsSubSync(t, ncS2, "asub")
+	// This time we will have the account in the map and it will be interest-only
+	checkGWInterestOnlyMode(t, s1, "B", "$foo")
+
+	// Now publish a message, still should not go because the sub is on "asub"
+	natsPub(t, nc, "foo", []byte("hello"))
+	natsFlush(t, nc)
+	checkCount(t, gwcb, 0)
+
+	natsSubSync(t, ncS2, "foo")
+	natsFlush(t, ncS2)
+
+	checkGWInterestOnlyModeInterestOn(t, s1, "B", "$foo", "foo")
+
+	// Publish on foo
+	natsPub(t, nc, "foo", []byte("hello"))
+	natsFlush(t, nc)
+	checkCount(t, gwcb, 1)
+}
+
+func TestGatewaySlowConsumer(t *testing.T) {
+	gatewayMaxPingInterval = 50 * time.Millisecond
+	defer func() { gatewayMaxPingInterval = gwMaxPingInterval }()
+
+	ob := testDefaultOptionsForGateway("B")
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	c := sa.getOutboundGatewayConnection("B")
+	c.mu.Lock()
+	c.out.wdl = time.Nanosecond
+	c.mu.Unlock()
+
+	<-time.After(250 * time.Millisecond)
+	got := sa.NumSlowConsumersGateways()
+	expected := uint64(1)
+	if got != 1 {
+		t.Errorf("got: %d, expected: %d", got, expected)
+	}
+	got = sb.NumSlowConsumersGateways()
+	expected = 0
+	if got != expected {
+		t.Errorf("got: %d, expected: %d", got, expected)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/5187
+func TestGatewayConnectEvents(t *testing.T) {
+	checkEvents := func(t *testing.T, name string, queue bool) {
+		t.Run(name, func(t *testing.T) {
+			ca := createClusterEx(t, true, 5*time.Millisecond, true, "A", 2)
+			defer shutdownCluster(ca)
+
+			cb := createClusterEx(t, true, 5*time.Millisecond, true, "B", 2, ca)
+			defer shutdownCluster(cb)
+
+			sysA, err := nats.Connect(ca.randomServer().ClientURL(), nats.UserInfo("sys", "pass"))
+			require_NoError(t, err)
+			defer sysA.Close()
+
+			var sub1 *nats.Subscription
+			if queue {
+				sub1, err = sysA.QueueSubscribeSync("$SYS.ACCOUNT.FOO.CONNECT", "myqueue")
+			} else {
+				sub1, err = sysA.SubscribeSync("$SYS.ACCOUNT.FOO.CONNECT")
+			}
+			require_NoError(t, err)
+
+			cA, err := nats.Connect(ca.randomServer().ClientURL(), nats.UserInfo("foo", "pass"))
+			require_NoError(t, err)
+			defer cA.Close()
+
+			msg, err := sub1.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Subject, "$SYS.ACCOUNT.FOO.CONNECT")
+
+			cB, err := nats.Connect(cb.randomServer().ClientURL(), nats.UserInfo("foo", "pass"))
+			require_NoError(t, err)
+			defer cB.Close()
+
+			msg, err = sub1.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_Equal(t, msg.Subject, "$SYS.ACCOUNT.FOO.CONNECT")
+		})
+	}
+
+	checkEvents(t, "Unqueued", false)
+	checkEvents(t, "Queued", true)
+}
+
+func disconnectInboundGateways(s *Server) {
+	s.gateway.RLock()
+	in := s.gateway.in
+	s.gateway.RUnlock()
+
+	s.gateway.RLock()
+	for _, client := range in {
+		s.gateway.RUnlock()
+		client.closeConnection(ClientClosed)
+		s.gateway.RLock()
+	}
+	s.gateway.RUnlock()
+}
+
+type testMissingOCSPStapleLogger struct {
+	DummyLogger
+	ch chan string
+}
+
+func (l *testMissingOCSPStapleLogger) Errorf(format string, v ...any) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "peer missing OCSP Staple") {
+		select {
+		case l.ch <- msg:
+		default:
+		}
+	}
+}
+
+func TestGatewayOCSPMissingPeerStapleIssue(t *testing.T) {
+	const (
+		caCert = "../test/configs/certs/ocsp/ca-cert.pem"
+		caKey  = "../test/configs/certs/ocsp/ca-key.pem"
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ocspr := NewOCSPResponderCustomTimeout(t, caCert, caKey, 10*time.Minute)
+	defer ocspr.Shutdown(ctx)
+	addr := fmt.Sprintf("http://%s", ocspr.Addr)
+
+	// Node A
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-01-cert.pem", ocsp.Good)
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-02-cert.pem", ocsp.Good)
+
+	// Node B
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-03-cert.pem", ocsp.Good)
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-04-cert.pem", ocsp.Good)
+
+	// Node C
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-05-cert.pem", ocsp.Good)
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-06-cert.pem", ocsp.Good)
+
+	// Node A rotated certs
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-07-cert.pem", ocsp.Good)
+	SetOCSPStatus(t, addr, "../test/configs/certs/ocsp/server-status-request-url-08-cert.pem", ocsp.Good)
+
+	// Store Dirs
+	storeDirA := t.TempDir()
+	storeDirB := t.TempDir()
+	storeDirC := t.TempDir()
+
+	// Gateway server configuration
+	srvConfA := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "AAA"
+
+		ocsp { mode = always }
+
+                system_account = sys
+                accounts {
+                  sys   { users = [{ user: sys, pass: sys }]}
+                  guest { users = [{ user: guest, pass: guest }]}
+                }
+                no_auth_user = guest
+
+		store_dir: '%s'
+		gateway {
+			name: A
+			host: "127.0.0.1"
+			port: -1
+			advertise: "127.0.0.1"
+
+			tls {
+				cert_file: "../test/configs/certs/ocsp/server-status-request-url-02-cert.pem"
+				key_file: "../test/configs/certs/ocsp/server-status-request-url-02-key.pem"
+				ca_file: "../test/configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+			}
+		}
+	`
+	srvConfA = fmt.Sprintf(srvConfA, storeDirA)
+	sconfA := createConfFile(t, []byte(srvConfA))
+	srvA, optsA := RunServerWithConfig(sconfA)
+	defer srvA.Shutdown()
+
+	// Gateway B connects to Gateway A.
+	srvConfB := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "BBB"
+
+		ocsp { mode = always }
+
+                system_account = sys
+                accounts {
+                  sys   { users = [{ user: sys, pass: sys }]}
+                  guest { users = [{ user: guest, pass: guest }]}
+                }
+                no_auth_user = guest
+
+		store_dir: '%s'
+		gateway {
+			name: B
+			host: "127.0.0.1"
+			advertise: "127.0.0.1"
+			port: -1
+			gateways: [{
+				name: "A"
+				url: "nats://127.0.0.1:%d"
+			}]
+
+			tls {
+				cert_file: "../test/configs/certs/ocsp/server-status-request-url-04-cert.pem"
+				key_file: "../test/configs/certs/ocsp/server-status-request-url-04-key.pem"
+				ca_file: "../test/configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+			}
+		}
+	`
+	srvConfB = fmt.Sprintf(srvConfB, storeDirB, optsA.Gateway.Port)
+	conf := createConfFile(t, []byte(srvConfB))
+	srvB, optsB := RunServerWithConfig(conf)
+	defer srvB.Shutdown()
+
+	// Client connects to server A.
+	cA, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Port),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cA.Close()
+
+	// Wait for connectivity between A and B.
+	waitForOutboundGateways(t, srvB, 1, 5*time.Second)
+
+	// Gateway C also connects to Gateway A.
+	srvConfC := `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "CCC"
+
+		ocsp { mode = always }
+
+                system_account = sys
+                accounts {
+                  sys   { users = [{ user: sys, pass: sys }]}
+                  guest { users = [{ user: guest, pass: guest }]}
+                }
+                no_auth_user = guest
+
+		store_dir: '%s'
+		gateway {
+			name: C
+			host: "127.0.0.1"
+			advertise: "127.0.0.1"
+			port: -1
+			gateways: [{name: "A", url: "nats://127.0.0.1:%d" }]
+
+			tls {
+				cert_file: "../test/configs/certs/ocsp/server-status-request-url-06-cert.pem"
+				key_file: "../test/configs/certs/ocsp/server-status-request-url-06-key.pem"
+				ca_file: "../test/configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+			}
+		}
+	`
+	srvConfC = fmt.Sprintf(srvConfC, storeDirC, optsA.Gateway.Port)
+	conf = createConfFile(t, []byte(srvConfC))
+	srvC, optsC := RunServerWithConfig(conf)
+	defer srvC.Shutdown()
+
+	////////////////////////////////////////////////////////////////////////////
+	//                                                                        //
+	//  A and B are connected at this point and A is starting with certs that //
+	//  will be rotated.
+	//                                                                        //
+	////////////////////////////////////////////////////////////////////////////
+	cB, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", optsB.Port),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	require_NoError(t, err)
+	defer cB.Close()
+
+	cC, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", optsC.Port),
+		nats.ErrorHandler(noOpErrHandler),
+	)
+	require_NoError(t, err)
+	defer cC.Close()
+
+	_, err = cA.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond(nil)
+	})
+	require_NoError(t, err)
+
+	cA.Flush()
+
+	_, err = cB.Subscribe("bar", func(m *nats.Msg) {
+		m.Respond(nil)
+	})
+	require_NoError(t, err)
+	cB.Flush()
+
+	waitForOutboundGateways(t, srvB, 1, 10*time.Second)
+	waitForOutboundGateways(t, srvC, 2, 10*time.Second)
+
+	/////////////////////////////////////////////////////////////////////////////////
+	//                                                                             //
+	//  Switch all the certs from server A, all OCSP monitors should be restarted  //
+	//  so it should have new staples.                                             //
+	//                                                                             //
+	/////////////////////////////////////////////////////////////////////////////////
+	srvConfA = `
+		host: "127.0.0.1"
+		port: -1
+
+		server_name: "AAA"
+
+		ocsp { mode = always }
+
+                system_account = sys
+                accounts {
+                  sys   { users = [{ user: sys, pass: sys }]}
+                  guest { users = [{ user: guest, pass: guest }]}
+                }
+                no_auth_user = guest
+
+		store_dir: '%s'
+		gateway {
+			name: A
+			host: "127.0.0.1"
+			port: -1
+			advertise: "127.0.0.1"
+
+			tls {
+				cert_file: "../test/configs/certs/ocsp/server-status-request-url-08-cert.pem"
+				key_file: "../test/configs/certs/ocsp/server-status-request-url-08-key.pem"
+				ca_file: "../test/configs/certs/ocsp/ca-cert.pem"
+				timeout: 5
+
+			}
+		}
+	`
+
+	srvConfA = fmt.Sprintf(srvConfA, storeDirA)
+	if err := os.WriteFile(sconfA, []byte(srvConfA), 0666); err != nil {
+		t.Fatalf("Error writing config: %v", err)
+	}
+	if err := srvA.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	waitForOutboundGateways(t, srvA, 2, 5*time.Second)
+	waitForOutboundGateways(t, srvB, 2, 5*time.Second)
+	waitForOutboundGateways(t, srvC, 2, 5*time.Second)
+
+	// Now clients connect to C can communicate with B and A.
+	_, err = cC.Request("foo", nil, 2*time.Second)
+	require_NoError(t, err)
+
+	_, err = cC.Request("bar", nil, 2*time.Second)
+	require_NoError(t, err)
+
+	// Reload and disconnect very fast trying to produce the race.
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Swap logger from server to capture the missing peer log.
+	lA := &testMissingOCSPStapleLogger{ch: make(chan string, 30)}
+	srvA.SetLogger(lA, false, false)
+
+	lB := &testMissingOCSPStapleLogger{ch: make(chan string, 30)}
+	srvB.SetLogger(lB, false, false)
+
+	lC := &testMissingOCSPStapleLogger{ch: make(chan string, 30)}
+	srvC.SetLogger(lC, false, false)
+
+	// Start with a reload from the last server that connected directly to A.
+	err = srvC.Reload()
+	require_NoError(t, err)
+
+	// Stress reconnections and reloading servers without getting
+	// missing OCSP peer staple errors.
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(500 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			disconnectInboundGateways(srvA)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(500 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			disconnectInboundGateways(srvB)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(500 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			disconnectInboundGateways(srvC)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(700 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			srvC.Reload()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(800 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			srvB.Reload()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for range time.NewTicker(900 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				wg.Done()
+				return
+			default:
+			}
+			srvA.Reload()
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case msg := <-lA.ch:
+		t.Fatalf("Server A: Got OCSP Staple error: %v", msg)
+	case msg := <-lB.ch:
+		t.Fatalf("Server B: Got OCSP Staple error: %v", msg)
+	case msg := <-lC.ch:
+		t.Fatalf("Server C: Got OCSP Staple error: %v", msg)
+	}
+	waitForOutboundGateways(t, srvA, 2, 5*time.Second)
+	waitForOutboundGateways(t, srvB, 2, 5*time.Second)
+	waitForOutboundGateways(t, srvC, 2, 5*time.Second)
+	wg.Wait()
+}
+
+func TestGatewayOutboundDetectsStaleConnectionIfNoInfo(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require_NoError(t, err)
+	defer l.Close()
+
+	ch := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		<-ch
+	}()
+
+	url := fmt.Sprintf("nats://%s", l.Addr())
+	o := testGatewayOptionsFromToWithURLs(t, "A", "B", []string{url})
+	o.gatewaysSolicitDelay = time.Millisecond
+	o.DisableShortFirstPing = false
+	o.PingInterval = 50 * time.Millisecond
+	o.MaxPingsOut = 3
+	o.NoLog = false
+	s, err := NewServer(o)
+	require_NoError(t, err)
+	defer s.Shutdown()
+
+	log := &captureDebugLogger{dbgCh: make(chan string, 100)}
+	s.SetLogger(log, true, false)
+	s.Start()
+
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for done := false; !done; {
+		select {
+		case dbg := <-log.dbgCh:
+			// The server should not send PING because the accept side expects
+			// the CONNECT as the first protocol (otherwise it would be a parse
+			// error if that were to happen).
+			if strings.Contains(dbg, "Ping Timer") {
+				t.Fatalf("The server should not have sent a ping, got %q", dbg)
+			}
+			// However, it should detect at one point that the connection is
+			// stale and close it.
+			if strings.Contains(dbg, "Stale") {
+				done = true
+			}
+		case <-timeout.C:
+			t.Fatalf("Did not capture the stale connection condition")
+		}
+	}
+
+	s.Shutdown()
+	close(ch)
+	wg.Wait()
+	s.WaitForShutdown()
 }

@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,10 +19,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -51,7 +51,7 @@ func checkForErr(totalWait, sleepDur time.Duration, f func() error) error {
 	return err
 }
 
-func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
+func checkFor(t testing.TB, totalWait, sleepDur time.Duration, f func() error) {
 	t.Helper()
 	err := checkForErr(totalWait, sleepDur, f)
 	if err != nil {
@@ -87,7 +87,7 @@ func RunServer(opts *Options) *Server {
 	}
 
 	// Run server in Go routine.
-	go s.Start()
+	s.Start()
 
 	// Wait for accept loop(s) to be started
 	if err := s.readyForConnections(10 * time.Second); err != nil {
@@ -420,7 +420,7 @@ func TestClientAdvertiseInCluster(t *testing.T) {
 
 	checkURLs := func(expected string) {
 		t.Helper()
-		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 			srvs := nc.DiscoveredServers()
 			for _, u := range srvs {
 				if u == expected {
@@ -442,7 +442,7 @@ func TestClientAdvertiseInCluster(t *testing.T) {
 	checkURLs("nats://srvBC:4222")
 
 	srvB.Shutdown()
-	checkNumRoutes(t, srvA, 1)
+	checkNumRoutes(t, srvA, DEFAULT_ROUTE_POOL_SIZE+1)
 	checkURLs("nats://srvBC:4222")
 }
 
@@ -612,6 +612,8 @@ func TestNilMonitoringPort(t *testing.T) {
 type DummyAuth struct {
 	t         *testing.T
 	needNonce bool
+	deadline  time.Time
+	register  bool
 }
 
 func (d *DummyAuth) Check(c ClientAuthentication) bool {
@@ -621,12 +623,26 @@ func (d *DummyAuth) Check(c ClientAuthentication) bool {
 		d.t.Fatalf("Received a nonce when none was expected")
 	}
 
-	return c.GetOpts().Username == "valid"
+	if c.GetOpts().Username != "valid" {
+		return false
+	}
+
+	if !d.register {
+		return true
+	}
+
+	u := &User{
+		Username:           c.GetOpts().Username,
+		ConnectionDeadline: d.deadline,
+	}
+	c.RegisterUser(u)
+
+	return true
 }
 
 func TestCustomClientAuthentication(t *testing.T) {
 	testAuth := func(t *testing.T, nonce bool) {
-		clientAuth := &DummyAuth{t, nonce}
+		clientAuth := &DummyAuth{t: t, needNonce: nonce}
 
 		opts := DefaultOptions()
 		opts.CustomClientAuthentication = clientAuth
@@ -676,7 +692,8 @@ func TestCustomRouterAuthentication(t *testing.T) {
 	s3 := RunServer(opts3)
 	defer s3.Shutdown()
 	checkClusterFormed(t, s, s3)
-	checkNumRoutes(t, s3, 1)
+	// Default pool size + 1 for system account
+	checkNumRoutes(t, s3, DEFAULT_ROUTE_POOL_SIZE+1)
 }
 
 func TestMonitoringNoTimeout(t *testing.T) {
@@ -757,10 +774,7 @@ func TestLameDuckMode(t *testing.T) {
 
 	// Check that if there is no client, server is shutdown
 	srvA.lameDuckMode()
-	srvA.mu.Lock()
-	shutdown := srvA.shutdown
-	srvA.mu.Unlock()
-	if !shutdown {
+	if !srvA.isShuttingDown() {
 		t.Fatalf("Server should have shutdown")
 	}
 
@@ -1206,9 +1220,7 @@ func TestServerValidateGatewaysOptions(t *testing.T) {
 func TestAcceptError(t *testing.T) {
 	o := DefaultOptions()
 	s := New(o)
-	s.mu.Lock()
-	s.running = true
-	s.mu.Unlock()
+	s.running.Store(true)
 	defer s.Shutdown()
 	orgDelay := time.Hour
 	delay := s.acceptError("Test", fmt.Errorf("any error"), orgDelay)
@@ -1604,10 +1616,9 @@ func TestConnectErrorReports(t *testing.T) {
 		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_CONNECT_ERROR_REPORTS, ra)
 	}
 
-	tmpFile := createFile(t, "")
+	tmpFile := createTempFile(t, "")
 	log := tmpFile.Name()
 	tmpFile.Close()
-	defer removeFile(t, log)
 
 	remoteURLs := RoutesFromStr("nats://127.0.0.1:1234")
 
@@ -1625,7 +1636,7 @@ func TestConnectErrorReports(t *testing.T) {
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1673,7 +1684,7 @@ func TestConnectErrorReports(t *testing.T) {
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1756,10 +1767,9 @@ func TestReconnectErrorReports(t *testing.T) {
 		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_RECONNECT_ERROR_REPORTS, ra)
 	}
 
-	tmpFile := createFile(t, "")
+	tmpFile := createTempFile(t, "")
 	log := tmpFile.Name()
 	tmpFile.Close()
-	defer removeFile(t, log)
 
 	csOpts := DefaultOptions()
 	csOpts.Cluster.Port = -1
@@ -1789,7 +1799,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1828,6 +1838,7 @@ func TestReconnectErrorReports(t *testing.T) {
 
 	// Now try with leaf nodes
 	csOpts.Cluster.Port = 0
+	csOpts.Cluster.Name = _EMPTY_
 	csOpts.LeafNode.Host = "127.0.0.1"
 	csOpts.LeafNode.Port = -1
 
@@ -1835,6 +1846,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	defer cs.Shutdown()
 
 	opts.Cluster.Port = 0
+	opts.Cluster.Name = _EMPTY_
 	opts.Routes = nil
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", csOpts.LeafNode.Port))
 	opts.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
@@ -1850,7 +1862,7 @@ func TestReconnectErrorReports(t *testing.T) {
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
 		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-			content, err := ioutil.ReadFile(log)
+			content, err := os.ReadFile(log)
 			if err != nil {
 				return fmt.Errorf("Error reading log file: %v", err)
 			}
@@ -1940,17 +1952,13 @@ func TestReconnectErrorReports(t *testing.T) {
 }
 
 func TestServerLogsConfigurationFile(t *testing.T) {
-	tmpDir := createDir(t, "_nats-server")
-	defer removeDir(t, tmpDir)
-
-	file := createFileAtDir(t, tmpDir, "nats_server_log_")
+	file := createTempFile(t, "nats_server_log_")
 	file.Close()
 
 	conf := createConfFile(t, []byte(fmt.Sprintf(`
 	port: -1
 	logfile: '%s'
 	`, file.Name())))
-	defer removeFile(t, conf)
 
 	o := LoadConfig(conf)
 	o.ConfigFile = file.Name()
@@ -1958,7 +1966,7 @@ func TestServerLogsConfigurationFile(t *testing.T) {
 	s := RunServer(o)
 	s.Shutdown()
 
-	log, err := ioutil.ReadFile(file.Name())
+	log, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Error reading log file: %v", err)
 	}
@@ -2072,4 +2080,48 @@ func TestServerRateLimitLogging(t *testing.T) {
 	c2.RateLimitWarnf("Warning number 2")
 
 	checkLog(c1, c2)
+}
+
+// https://github.com/nats-io/nats-server/discussions/4535
+func TestServerAuthBlockAndSysAccounts(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		server_name: s-test
+		authorization {
+			users = [ { user: "u", password: "pass"} ]
+		}
+		accounts {
+			$SYS: { users: [ { user: admin, password: pwd } ] }
+		}
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// This should work of course.
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("u", "pass"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	// This should not.
+	_, err = nats.Connect(s.ClientURL())
+	require_Error(t, err, nats.ErrAuthorization, errors.New("nats: Authorization Violation"))
+}
+
+// https://github.com/nats-io/nats-server/issues/5396
+func TestServerConfigLastLineComments(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	{
+		"listen":  "0.0.0.0:4222"
+	}
+	# wibble
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// This should work of course.
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
 }

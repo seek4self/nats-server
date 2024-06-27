@@ -1,4 +1,4 @@
-// Copyright 2020 The NATS Authors
+// Copyright 2020-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,6 @@ package server
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -24,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -32,11 +30,15 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+
+	"github.com/klauspost/compress/flate"
 )
 
 type testReader struct {
@@ -1610,7 +1612,6 @@ func TestWSParseOptions(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, []byte(test.content))
-			defer removeFile(t, conf)
 			o, err := ProcessConfigFile(conf)
 			if test.err != _EMPTY_ {
 				if err == nil || !strings.Contains(err.Error(), test.err) {
@@ -1705,7 +1706,7 @@ type captureFatalLogger struct {
 	fatalCh chan string
 }
 
-func (l *captureFatalLogger) Fatalf(format string, v ...interface{}) {
+func (l *captureFatalLogger) Fatalf(format string, v ...any) {
 	select {
 	case l.fatalCh <- fmt.Sprintf(format, v...):
 	default:
@@ -1872,7 +1873,7 @@ func testNewWSClientWithError(t testing.TB, o testWSClientOptions) (net.Conn, *b
 type testClaimsOptions struct {
 	nac            *jwt.AccountClaims
 	nuc            *jwt.UserClaims
-	connectRequest interface{}
+	connectRequest any
 	dontSign       bool
 	expectAnswer   string
 }
@@ -2014,7 +2015,7 @@ func testWSReadFrame(t testing.TB, br *bufio.Reader) []byte {
 	buf = append(buf, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff)
 	dbr := bytes.NewBuffer(buf)
 	d := flate.NewReader(dbr)
-	uncompressed, err := ioutil.ReadAll(d)
+	uncompressed, err := io.ReadAll(d)
 	if err != nil {
 		t.Fatalf("Error reading frame: %v", err)
 	}
@@ -2086,7 +2087,6 @@ func TestWSPubSub(t *testing.T) {
 					ok = 1
 					continue
 				} else if ok == 1 && bytes.Contains(line, []byte("from nats")) {
-					ok = 2
 					break
 				}
 			}
@@ -2204,7 +2204,7 @@ func TestWSTLSVerifyClientCert(t *testing.T) {
 			if !test.provideCert {
 				if err == nil {
 					t.Fatal("Expected error, did not get one")
-				} else if !strings.Contains(err.Error(), "bad certificate") {
+				} else if !strings.Contains(err.Error(), "bad certificate") && !strings.Contains(err.Error(), "certificate required") {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 				return
@@ -2308,7 +2308,7 @@ func TestWSTLSVerifyAndMap(t *testing.T) {
 			if !test.provideCert {
 				if err == nil {
 					t.Fatal("Expected error, did not get one")
-				} else if !strings.Contains(err.Error(), "bad certificate") {
+				} else if !strings.Contains(err.Error(), "bad certificate") && !strings.Contains(err.Error(), "certificate required") {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 				return
@@ -2499,7 +2499,7 @@ func TestWSAdvertise(t *testing.T) {
 	defer s.Shutdown()
 	l := &captureFatalLogger{fatalCh: make(chan string, 1)}
 	s.SetLogger(l, false, false)
-	go s.Start()
+	s.Start()
 	select {
 	case e := <-l.fatalCh:
 		if !strings.Contains(e, "Unable to get websocket connect URLs") {
@@ -2866,11 +2866,11 @@ func (wc *testWSWrappedConn) Write(p []byte) (int, error) {
 }
 
 func TestWSCompressionBasic(t *testing.T) {
-	payload := "This is the content of a message that will be compresseddddddddddddddddddddd."
+	payload := "This is the content of a message that will be compresseddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd."
 	msgProto := fmt.Sprintf("MSG foo 1 %d\r\n%s\r\n", len(payload), payload)
-
 	cbuf := &bytes.Buffer{}
-	compressor, _ := flate.NewWriter(cbuf, flate.BestSpeed)
+	compressor, err := flate.NewWriter(cbuf, flate.BestSpeed)
+	require_NoError(t, err)
 	compressor.Write([]byte(msgProto))
 	compressor.Flush()
 	compressed := cbuf.Bytes()
@@ -2893,14 +2893,14 @@ func TestWSCompressionBasic(t *testing.T) {
 	}
 
 	var wc *testWSWrappedConn
-	s.mu.Lock()
+	s.mu.RLock()
 	for _, c := range s.clients {
 		c.mu.Lock()
 		wc = &testWSWrappedConn{Conn: c.nc, buf: &bytes.Buffer{}}
 		c.nc = wc
 		c.mu.Unlock()
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
@@ -3127,7 +3127,7 @@ func TestWSCompressionFrameSizeLimit(t *testing.T) {
 			buf = append(buf, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff)
 			dbr := bytes.NewBuffer(buf)
 			d := flate.NewReader(dbr)
-			uncompressed, err := ioutil.ReadAll(d)
+			uncompressed, err := io.ReadAll(d)
 			if err != nil {
 				t.Fatalf("Error reading frame: %v", err)
 			}
@@ -3394,7 +3394,6 @@ func TestWSBindToProperAccount(t *testing.T) {
 			no_tls: true
 		}
 	`, jwt.ConnectionTypeStandard, strings.ToLower(jwt.ConnectionTypeWebsocket)))) // on purpose use lower case to ensure that it is converted.
-	defer removeFile(t, conf)
 	s, o := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3853,60 +3852,135 @@ func TestWSJWTCookieUser(t *testing.T) {
 }
 
 func TestWSReloadTLSConfig(t *testing.T) {
+	tlsBlock := `
+		tls {
+			cert_file: '%s'
+			key_file: '%s'
+			ca_file: '../test/configs/certs/ca.pem'
+			verify: %v
+		}
+	`
 	template := `
 		listen: "127.0.0.1:-1"
 		websocket {
 			listen: "127.0.0.1:-1"
-			tls {
-				cert_file: '%s'
-				key_file: '%s'
-				ca_file: '../test/configs/certs/ca.pem'
-			}
+			%s
+			no_tls: %v
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template,
-		"../test/configs/certs/server-noip.pem",
-		"../test/configs/certs/server-key-noip.pem")))
-	defer removeFile(t, conf)
+		fmt.Sprintf(tlsBlock,
+			"../test/configs/certs/server-noip.pem",
+			"../test/configs/certs/server-key-noip.pem",
+			false), false)))
 
 	s, o := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", o.Websocket.Port)
-	wsc, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Error creating ws connection: %v", err)
+
+	check := func(tlsConfig *tls.Config, handshakeFail bool, errTxt string) {
+		t.Helper()
+
+		wsc, err := net.Dial("tcp", addr)
+		require_NoError(t, err)
+		defer wsc.Close()
+
+		wsc = tls.Client(wsc, tlsConfig)
+		err = wsc.(*tls.Conn).Handshake()
+		if handshakeFail {
+			require_True(t, err != nil)
+			require_Contains(t, err.Error(), errTxt)
+			return
+		}
+		require_NoError(t, err)
+
+		req := testWSCreateValidReq()
+		req.URL, _ = url.Parse(wsSchemePrefixTLS + "://" + addr)
+		err = req.Write(wsc)
+		require_NoError(t, err)
+
+		br := bufio.NewReader(wsc)
+		resp, err := http.ReadResponse(br, req)
+		if errTxt == _EMPTY_ {
+			require_NoError(t, err)
+		} else {
+			require_True(t, err != nil)
+			require_Contains(t, err.Error(), errTxt)
+			return
+		}
+		defer resp.Body.Close()
+		l := testWSReadFrame(t, br)
+		require_True(t, bytes.HasPrefix(l, []byte("INFO {")))
+		var info Info
+		err = json.Unmarshal(l[5:], &info)
+		require_NoError(t, err)
+		require_True(t, info.TLSAvailable)
+		require_True(t, info.TLSRequired)
+		require_Equal[string](t, info.Host, "127.0.0.1")
+		require_Equal[int](t, info.Port, o.Websocket.Port)
 	}
-	defer wsc.Close()
 
 	tc := &TLSConfigOpts{CaFile: "../test/configs/certs/ca.pem"}
 	tlsConfig, err := GenTLSConfig(tc)
-	if err != nil {
-		t.Fatalf("Error generating TLS config: %v", err)
-	}
+	require_NoError(t, err)
 	tlsConfig.ServerName = "127.0.0.1"
 	tlsConfig.RootCAs = tlsConfig.ClientCAs
 	tlsConfig.ClientCAs = nil
-	wsc = tls.Client(wsc, tlsConfig.Clone())
-	if err := wsc.(*tls.Conn).Handshake(); err == nil || !strings.Contains(err.Error(), "SAN") {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	wsc.Close()
 
+	// Handshake should fail with error regarding SANs
+	check(tlsConfig.Clone(), true, "SAN")
+
+	// Replace certs with ones that allow IP.
 	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template,
-		"../test/configs/certs/server-cert.pem",
-		"../test/configs/certs/server-key.pem"))
+		fmt.Sprintf(tlsBlock,
+			"../test/configs/certs/server-cert.pem",
+			"../test/configs/certs/server-key.pem",
+			false), false))
 
-	wsc, err = net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Error creating ws connection: %v", err)
-	}
-	defer wsc.Close()
+	// Connection should succeed
+	check(tlsConfig.Clone(), false, _EMPTY_)
 
-	wsc = tls.Client(wsc, tlsConfig.Clone())
-	if err := wsc.(*tls.Conn).Handshake(); err != nil {
-		t.Fatalf("Error on TLS handshake: %v", err)
+	// Udpate config to require client cert.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template,
+		fmt.Sprintf(tlsBlock,
+			"../test/configs/certs/server-cert.pem",
+			"../test/configs/certs/server-key.pem",
+			true), false))
+
+	// Connection should fail saying that a tls cert is required
+	check(tlsConfig.Clone(), false, "required")
+
+	// Add a client cert
+	tc = &TLSConfigOpts{
+		CertFile: "../test/configs/certs/client-cert.pem",
+		KeyFile:  "../test/configs/certs/client-key.pem",
 	}
+	tlsConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	tlsConfig.InsecureSkipVerify = true
+
+	// Connection should succeed
+	check(tlsConfig.Clone(), false, _EMPTY_)
+
+	// Removing the tls{} block but with no_tls still false should fail
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, _EMPTY_, false)))
+	err = s.Reload()
+	require_True(t, err != nil)
+	require_Contains(t, err.Error(), "TLS configuration")
+
+	// We should still be able to connect a TLS client
+	check(tlsConfig.Clone(), false, _EMPTY_)
+
+	// Now remove the tls{} block and set no_tls: true and that should fail
+	// since this is not supported.
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, _EMPTY_, true)))
+	err = s.Reload()
+	require_True(t, err != nil)
+	require_Contains(t, err.Error(), "not supported")
+
+	// We should still be able to connect a TLS client
+	check(tlsConfig.Clone(), false, _EMPTY_)
 }
 
 type captureClientConnectedLogger struct {
@@ -3914,7 +3988,7 @@ type captureClientConnectedLogger struct {
 	ch chan string
 }
 
-func (l *captureClientConnectedLogger) Debugf(format string, v ...interface{}) {
+func (l *captureClientConnectedLogger) Debugf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if !strings.Contains(msg, "Client connection created") {
 		return
@@ -4004,6 +4078,189 @@ func TestWSXForwardedFor(t *testing.T) {
 	}
 }
 
+type partialWriteConn struct {
+	net.Conn
+}
+
+func (c *partialWriteConn) Write(b []byte) (int, error) {
+	max := len(b)
+	if max > 0 {
+		max = rand.Intn(max)
+		if max == 0 {
+			max = 1
+		}
+	}
+	n, err := c.Conn.Write(b[:max])
+	if err == nil && max != len(b) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func TestWSWithPartialWrite(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		websocket {
+			listen: "127.0.0.1:-1"
+			no_tls: true
+		}
+	`))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc1 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o.Websocket.Port))
+	defer nc1.Close()
+
+	sub := natsSubSync(t, nc1, "foo")
+	sub.SetPendingLimits(-1, -1)
+	natsFlush(t, nc1)
+
+	nc2 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o.Websocket.Port))
+	defer nc2.Close()
+
+	// Replace websocket connections with ones that will produce short writes.
+	s.mu.RLock()
+	for _, c := range s.clients {
+		c.mu.Lock()
+		c.nc = &partialWriteConn{Conn: c.nc}
+		c.mu.Unlock()
+	}
+	s.mu.RUnlock()
+
+	var msgs [][]byte
+	for i := 0; i < 100; i++ {
+		msg := make([]byte, rand.Intn(10000)+10)
+		for j := 0; j < len(msg); j++ {
+			msg[j] = byte('A' + j%26)
+		}
+		msgs = append(msgs, msg)
+		natsPub(t, nc2, "foo", msg)
+	}
+	for i := 0; i < 100; i++ {
+		rmsg := natsNexMsg(t, sub, time.Second)
+		if !bytes.Equal(msgs[i], rmsg.Data) {
+			t.Fatalf("Expected message %q, got %q", msgs[i], rmsg.Data)
+		}
+	}
+}
+
+func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
+	tmpl := `
+               listen: "127.0.0.1:-1"
+               cluster {
+                       name: "local"
+                       port: -1
+                       %s
+               }
+               websocket {
+                       listen: "127.0.0.1:-1"
+                       no_tls: true
+               }
+       `
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_)))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	routes := fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port)
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
+	s2, o2 := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	conf3 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
+	s3, o3 := RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	nc3 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o3.Websocket.Port))
+	defer nc3.Close()
+
+	nc2 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o2.Websocket.Port))
+	defer nc2.Close()
+
+	payload := make([]byte, 100000)
+	for i := 0; i < len(payload); i++ {
+		payload[i] = 'A' + byte(i%26)
+	}
+	errCh := make(chan error, 1)
+	doneCh := make(chan struct{}, 1)
+	count := int32(0)
+
+	createSub := func(nc *nats.Conn) {
+		sub := natsSub(t, nc, "foo", func(m *nats.Msg) {
+			if !bytes.Equal(m.Data, payload) {
+				stop := len(m.Data)
+				if l := len(payload); l < stop {
+					stop = l
+				}
+				start := 0
+				for i := 0; i < stop; i++ {
+					if m.Data[i] != payload[i] {
+						start = i
+						break
+					}
+				}
+				if stop-start > 20 {
+					stop = start + 20
+				}
+				select {
+				case errCh <- fmt.Errorf("Invalid message: [%d bytes same]%s[...]", start, m.Data[start:stop]):
+				default:
+				}
+				return
+			}
+			if n := atomic.AddInt32(&count, 1); int(n) == 2*total {
+				doneCh <- struct{}{}
+			}
+		})
+		sub.SetPendingLimits(-1, -1)
+	}
+	createSub(nc2)
+	createSub(nc3)
+
+	checkSubInterest(t, s1, globalAccountName, "foo", time.Second)
+
+	nc1 := natsConnect(t, fmt.Sprintf("ws://127.0.0.1:%d", o1.Websocket.Port))
+	defer nc1.Close()
+	natsFlush(t, nc1)
+
+	// Change websocket connections to force a max frame size.
+	for _, s := range []*Server{s1, s2, s3} {
+		s.mu.RLock()
+		for _, c := range s.clients {
+			c.mu.Lock()
+			if c.ws != nil {
+				c.ws.browser = true
+			}
+			c.mu.Unlock()
+		}
+		s.mu.RUnlock()
+	}
+
+	for i := 0; i < total; i++ {
+		natsPub(t, nc1, "foo", payload)
+		if i%100 == 0 {
+			select {
+			case err := <-errCh:
+				t.Fatalf("Error: %v", err)
+			default:
+			}
+		}
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Error: %v", err)
+	case <-doneCh:
+		return
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Test timed out")
+	}
+}
+
+func TestWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
+	testWSNoCorruptionWithFrameSizeLimit(t, 1000)
+}
+
 // ==================================================================
 // = Benchmark tests
 // ==================================================================
@@ -4051,7 +4308,6 @@ func wsBenchPub(b *testing.B, numPubs int, compress bool, payload string) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
-	n := b.N
 	extra := 0
 	pubProto := []byte(fmt.Sprintf("PUB %s %d\r\n%s\r\n", testWSBenchSubject, len(payload), payload))
 	singleOpBuf := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, pubProto)
@@ -4070,7 +4326,7 @@ func wsBenchPub(b *testing.B, numPubs int, compress bool, payload string) {
 		}
 	}
 	sendBuf := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, tmp)
-	n = b.N / pb
+	n := b.N / pb
 	extra = b.N - (n * pb)
 
 	wg := sync.WaitGroup{}

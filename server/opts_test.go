@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"reflect"
@@ -73,6 +72,7 @@ func TestDefaultOptions(t *testing.T) {
 		MaxTracedMsgLen:       0,
 		JetStreamMaxMemory:    -1,
 		JetStreamMaxStore:     -1,
+		SyncInterval:          2 * time.Minute,
 	}
 
 	opts := &Options{}
@@ -120,6 +120,7 @@ func TestConfigFile(t *testing.T) {
 		LameDuckDuration:      4 * time.Minute,
 		ConnectErrorReports:   86400,
 		ReconnectErrorReports: 5,
+		authBlockDefined:      true,
 	}
 
 	opts, err := ProcessConfigFile("./configs/test.conf")
@@ -132,13 +133,14 @@ func TestConfigFile(t *testing.T) {
 
 func TestTLSConfigFile(t *testing.T) {
 	golden := &Options{
-		ConfigFile:  "./configs/tls.conf",
-		Host:        "127.0.0.1",
-		Port:        4443,
-		Username:    "derek",
-		Password:    "foo",
-		AuthTimeout: 1.0,
-		TLSTimeout:  2.0,
+		ConfigFile:       "./configs/tls.conf",
+		Host:             "127.0.0.1",
+		Port:             4443,
+		Username:         "derek",
+		Password:         "foo",
+		AuthTimeout:      1.0,
+		TLSTimeout:       2.0,
+		authBlockDefined: true,
 	}
 	opts, err := ProcessConfigFile("./configs/tls.conf")
 	if err != nil {
@@ -161,7 +163,8 @@ func TestTLSConfigFile(t *testing.T) {
 	if tlsConfig.MinVersion != tls.VersionTLS12 {
 		t.Fatalf("Expected MinVersion of 1.2 [%v], got [%v]", tls.VersionTLS12, tlsConfig.MinVersion)
 	}
-	if !tlsConfig.PreferServerCipherSuites {
+	//lint:ignore SA1019 We want to retry on a bunch of errors here.
+	if !tlsConfig.PreferServerCipherSuites { // nolint:staticcheck
 		t.Fatal("Expected PreferServerCipherSuites to be true")
 	}
 	// Verify hostname is correct in certificate
@@ -282,6 +285,7 @@ func TestMergeOverrides(t *testing.T) {
 		LameDuckDuration:      4 * time.Minute,
 		ConnectErrorReports:   86400,
 		ReconnectErrorReports: 5,
+		authBlockDefined:      true,
 	}
 	fopts, err := ProcessConfigFile("./configs/test.conf")
 	if err != nil {
@@ -880,7 +884,6 @@ func TestNkeyUsersConfig(t *testing.T) {
         {nkey: "UA3C5TBZYK5GJQJRWPMU6NFY5JNAEVQB2V2TUZFZDHFJFUYVKTTUOFKZ"}
       ]
     }`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v", err)
@@ -959,7 +962,6 @@ func TestTlsPinnedCertificates(t *testing.T) {
 				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
 		}
 	}`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v", err)
@@ -1033,7 +1035,6 @@ func TestNkeyUsersDefaultPermissionsConfig(t *testing.T) {
 			t.Fatal("Has unexpected Publish permission")
 		}
 	}
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v", err)
@@ -1094,7 +1095,6 @@ func TestNkeyUsersWithPermsConfig(t *testing.T) {
         }
       ]
     }`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v", err)
@@ -1128,14 +1128,14 @@ func TestNkeyUsersWithPermsConfig(t *testing.T) {
 
 func TestBadNkeyConfig(t *testing.T) {
 	confFileName := "nkeys_bad.conf"
-	defer removeFile(t, confFileName)
 	content := `
     authorization {
       users = [ {nkey: "Ufoo"}]
     }`
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(confFileName, []byte(content), 0666); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
+	defer removeFile(t, confFileName)
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error from nkey entry with password")
 	}
@@ -1143,16 +1143,16 @@ func TestBadNkeyConfig(t *testing.T) {
 
 func TestNkeyWithPassConfig(t *testing.T) {
 	confFileName := "nkeys_pass.conf"
-	defer removeFile(t, confFileName)
 	content := `
     authorization {
       users = [
         {nkey: "UDKTV7HZVYJFJN64LLMYQBUR6MTNNYCDC3LAZH4VHURW3GZLL3FULBXV", pass: "foo"}
       ]
     }`
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(confFileName, []byte(content), 0666); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
+	defer removeFile(t, confFileName)
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error from bad nkey entry")
 	}
@@ -1160,16 +1160,16 @@ func TestNkeyWithPassConfig(t *testing.T) {
 
 func TestTokenWithUserPass(t *testing.T) {
 	confFileName := "test.conf"
-	defer removeFile(t, confFileName)
 	content := `
 	authorization={
 		user: user
 		pass: password
 		token: $2a$11$whatever
 	}`
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(confFileName, []byte(content), 0666); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
+	defer removeFile(t, confFileName)
 	_, err := ProcessConfigFile(confFileName)
 	if err == nil {
 		t.Fatal("Expected error, got none")
@@ -1181,7 +1181,6 @@ func TestTokenWithUserPass(t *testing.T) {
 
 func TestTokenWithUsers(t *testing.T) {
 	confFileName := "test.conf"
-	defer removeFile(t, confFileName)
 	content := `
 	authorization={
 		token: $2a$11$whatever
@@ -1189,9 +1188,10 @@ func TestTokenWithUsers(t *testing.T) {
 			{user: test, password: test}
 		]
 	}`
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(confFileName, []byte(content), 0666); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
+	defer removeFile(t, confFileName)
 	_, err := ProcessConfigFile(confFileName)
 	if err == nil {
 		t.Fatal("Expected error, got none")
@@ -1202,11 +1202,7 @@ func TestTokenWithUsers(t *testing.T) {
 }
 
 func TestParseWriteDeadline(t *testing.T) {
-	confFile := "test.conf"
-	defer removeFile(t, confFile)
-	if err := ioutil.WriteFile(confFile, []byte("write_deadline: \"1x\""), 0666); err != nil {
-		t.Fatalf("Error writing config file: %v", err)
-	}
+	confFile := createConfFile(t, []byte("write_deadline: \"1x\""))
 	_, err := ProcessConfigFile(confFile)
 	if err == nil {
 		t.Fatal("Expected error, got none")
@@ -1214,10 +1210,7 @@ func TestParseWriteDeadline(t *testing.T) {
 	if !strings.Contains(err.Error(), "parsing") {
 		t.Fatalf("Expected error related to parsing, got %v", err)
 	}
-	removeFile(t, confFile)
-	if err := ioutil.WriteFile(confFile, []byte("write_deadline: \"1s\""), 0666); err != nil {
-		t.Fatalf("Error writing config file: %v", err)
-	}
+	confFile = createConfFile(t, []byte("write_deadline: \"1s\""))
 	opts, err := ProcessConfigFile(confFile)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1225,7 +1218,6 @@ func TestParseWriteDeadline(t *testing.T) {
 	if opts.WriteDeadline != time.Second {
 		t.Fatalf("Expected write_deadline to be 1s, got %v", opts.WriteDeadline)
 	}
-	removeFile(t, confFile)
 	oldStdout := os.Stdout
 	_, w, _ := os.Pipe()
 	defer func() {
@@ -1233,9 +1225,7 @@ func TestParseWriteDeadline(t *testing.T) {
 		os.Stdout = oldStdout
 	}()
 	os.Stdout = w
-	if err := ioutil.WriteFile(confFile, []byte("write_deadline: 2"), 0666); err != nil {
-		t.Fatalf("Error writing config file: %v", err)
-	}
+	confFile = createConfFile(t, []byte("write_deadline: 2"))
 	opts, err = ProcessConfigFile(confFile)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1353,7 +1343,6 @@ func TestMalformedClusterAddress(t *testing.T) {
 
 func TestPanic(t *testing.T) {
 	conf := createConfFile(t, []byte(`port: "this_string_trips_a_panic"`))
-	defer removeFile(t, conf)
 	opts, err := ProcessConfigFile(conf)
 	if err == nil {
 		t.Fatalf("Expected an error reading config file: got %+v", opts)
@@ -1366,7 +1355,6 @@ func TestPanic(t *testing.T) {
 
 func TestPingIntervalOld(t *testing.T) {
 	conf := createConfFile(t, []byte(`ping_interval: 5`))
-	defer removeFile(t, conf)
 	opts := &Options{}
 	err := opts.ProcessConfigFile(conf)
 	if err == nil {
@@ -1389,7 +1377,6 @@ func TestPingIntervalOld(t *testing.T) {
 
 func TestPingIntervalNew(t *testing.T) {
 	conf := createConfFile(t, []byte(`ping_interval: "5m"`))
-	defer removeFile(t, conf)
 	opts := &Options{}
 	if err := opts.ProcessConfigFile(conf); err != nil {
 		t.Fatalf("expected no error")
@@ -1638,7 +1625,6 @@ func TestClusterPermissionsConfig(t *testing.T) {
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer removeFile(t, conf)
 	opts, err := ProcessConfigFile(conf)
 	if err != nil {
 		if cerr, ok := err.(*processConfigErr); ok && len(cerr.Errors()) > 0 {
@@ -1673,7 +1659,6 @@ func TestClusterPermissionsConfig(t *testing.T) {
 			}
 		}
 	`)))
-	defer removeFile(t, conf)
 	opts, err = ProcessConfigFile(conf)
 	if err != nil {
 		t.Fatalf("Error processing config file: %v", err)
@@ -1753,7 +1738,6 @@ func TestClusterPermissionsConfig(t *testing.T) {
 			}
 		`, perms)))
 		_, err := ProcessConfigFile(conf)
-		removeFile(t, conf)
 		if err == nil {
 			t.Fatalf("Expected failure for permissions %s", perms)
 		}
@@ -1771,7 +1755,6 @@ func TestClusterPermissionsConfig(t *testing.T) {
 			}
 		`, perms)))
 		_, err := ProcessConfigFile(conf)
-		removeFile(t, conf)
 		if err == nil {
 			t.Fatalf("Expected failure for permissions %s", perms)
 		}
@@ -1879,7 +1862,6 @@ func TestParseServiceLatency(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			f := createConfFile(t, []byte(c.conf))
 			opts, err := ProcessConfigFile(f)
-			removeFile(t, f)
 			switch {
 			case c.wantErr && err == nil:
 				t.Fatalf("Expected ProcessConfigFile to fail, but didn't")
@@ -1913,6 +1895,7 @@ func TestParseServiceLatency(t *testing.T) {
 
 func TestParseExport(t *testing.T) {
 	conf := `
+		port: -1
 		system_account: sys
 		accounts {
 			sys {
@@ -1974,7 +1957,6 @@ func TestParseExport(t *testing.T) {
 		t.Fatal("Failed startup")
 	}
 	defer s.Shutdown()
-	defer removeFile(t, f)
 	connect := func(user string) *nats.Conn {
 		nc, err := nats.Connect(fmt.Sprintf("nats://%s:pwd@%s:%d", user, o.Host, o.Port))
 		require_NoError(t, err)
@@ -2107,10 +2089,10 @@ func TestParsingGateways(t *testing.T) {
 	}
 	`
 	file := "server_config_gateways.conf"
-	defer removeFile(t, file)
-	if err := ioutil.WriteFile(file, []byte(content), 0600); err != nil {
+	if err := os.WriteFile(file, []byte(content), 0600); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
+	defer removeFile(t, file)
 	opts, err := ProcessConfigFile(file)
 	if err != nil {
 		t.Fatalf("Error processing file: %v", err)
@@ -2361,10 +2343,10 @@ func TestParsingGatewaysErrors(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			file := fmt.Sprintf("server_config_gateways_%s.conf", test.name)
-			defer removeFile(t, file)
-			if err := ioutil.WriteFile(file, []byte(test.content), 0600); err != nil {
+			if err := os.WriteFile(file, []byte(test.content), 0600); err != nil {
 				t.Fatalf("Error writing config file: %v", err)
 			}
+			defer removeFile(t, file)
 			_, err := ProcessConfigFile(file)
 			if err == nil {
 				t.Fatalf("Expected to fail, did not. Content:\n%s", test.content)
@@ -2395,7 +2377,6 @@ func TestParsingLeafNodesListener(t *testing.T) {
 	}
 	`
 	conf := createConfFile(t, []byte(content))
-	defer removeFile(t, conf)
 	opts, err := ProcessConfigFile(conf)
 	if err != nil {
 		t.Fatalf("Error processing file: %v", err)
@@ -2437,7 +2418,6 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		}
 		`
 		conf := createConfFile(t, []byte(content))
-		defer removeFile(t, conf)
 		opts, err := ProcessConfigFile(conf)
 		if err != nil {
 			t.Fatalf("Error processing file: %v", err)
@@ -2477,7 +2457,6 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		}
 		`
 		conf := createConfFile(t, []byte(content))
-		defer removeFile(t, conf)
 		opts, err := ProcessConfigFile(conf)
 		if err != nil {
 			t.Fatalf("Error processing file: %v", err)
@@ -2505,6 +2484,7 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		}
 
 		content := `
+		port: -1
 		leafnodes {
 			remotes = [
 				{
@@ -2518,7 +2498,6 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		}
 		`
 		conf := createConfFile(t, []byte(fmt.Sprintf(content, confURLs)))
-		defer removeFile(t, conf)
 
 		s, _ := RunServerWithConfig(conf)
 		defer s.Shutdown()
@@ -2564,14 +2543,9 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 }
 
 func TestLargeMaxControlLine(t *testing.T) {
-	confFileName := "big_mcl.conf"
-	defer removeFile(t, confFileName)
-	content := `
-    max_control_line = 3000000000
-    `
-	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
-		t.Fatalf("Error writing config file: %v", err)
-	}
+	confFileName := createConfFile(t, []byte(`
+		max_control_line = 3000000000
+	`))
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error from too large of a max_control_line entry")
 	}
@@ -2581,7 +2555,6 @@ func TestLargeMaxPayload(t *testing.T) {
 	confFileName := createConfFile(t, []byte(`
 		max_payload = 3000000000
 	`))
-	defer removeFile(t, confFileName)
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error from too large of a max_payload entry")
 	}
@@ -2590,7 +2563,6 @@ func TestLargeMaxPayload(t *testing.T) {
 		max_payload = 100000
 		max_pending = 50000
 	`))
-	defer removeFile(t, confFileName)
 	o := LoadConfig(confFileName)
 	s, err := NewServer(o)
 	if err == nil || !strings.Contains(err.Error(), "cannot be higher") {
@@ -2608,7 +2580,6 @@ func TestHandleUnknownTopLevelConfigurationField(t *testing.T) {
 			id: "me"
 		}
 	`))
-	defer removeFile(t, conf)
 
 	// Verify that we get an error because of unknown "streaming" field.
 	opts := &Options{}
@@ -2646,7 +2617,6 @@ func TestSublistNoCacheConfig(t *testing.T) {
 	confFileName := createConfFile(t, []byte(`
       disable_sublist_cache: true
     `))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error reading config file: %v", err)
@@ -2671,7 +2641,6 @@ func TestSublistNoCacheConfigOnAccounts(t *testing.T) {
 	  }
 	  no_sys_acc = true
     `))
-	defer removeFile(t, confFileName)
 
 	s, _ := RunServerWithConfig(confFileName)
 	defer s.Shutdown()
@@ -2682,7 +2651,7 @@ func TestSublistNoCacheConfigOnAccounts(t *testing.T) {
 		t.Fatalf("Expected to have a server with %d active accounts, got %v", ta, la)
 	}
 
-	s.accounts.Range(func(k, v interface{}) bool {
+	s.accounts.Range(func(k, v any) bool {
 		acc := v.(*Account)
 		if acc == nil {
 			t.Fatalf("Expected non-nil sublist for account")
@@ -2741,54 +2710,42 @@ func TestParsingResponsePermissions(t *testing.T) {
 
 	// Check defaults
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "", "")))
-	defer removeFile(t, conf)
 	check(t, conf, "", DEFAULT_ALLOW_RESPONSE_MAX_MSGS, DEFAULT_ALLOW_RESPONSE_EXPIRATION)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 10", "")))
-	defer removeFile(t, conf)
 	check(t, conf, "", 10, DEFAULT_ALLOW_RESPONSE_EXPIRATION)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "", "ttl: 5s")))
-	defer removeFile(t, conf)
 	check(t, conf, "", DEFAULT_ALLOW_RESPONSE_MAX_MSGS, 5*time.Second)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 0", "")))
-	defer removeFile(t, conf)
 	check(t, conf, "", DEFAULT_ALLOW_RESPONSE_MAX_MSGS, DEFAULT_ALLOW_RESPONSE_EXPIRATION)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "", `ttl: "0s"`)))
-	defer removeFile(t, conf)
 	check(t, conf, "", DEFAULT_ALLOW_RESPONSE_MAX_MSGS, DEFAULT_ALLOW_RESPONSE_EXPIRATION)
 
 	// Check normal values
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 10", `ttl: "5s"`)))
-	defer removeFile(t, conf)
 	check(t, conf, "", 10, 5*time.Second)
 
 	// Check negative values ok
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: -1", `ttl: "5s"`)))
-	defer removeFile(t, conf)
 	check(t, conf, "", -1, 5*time.Second)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 10", `ttl: "-1s"`)))
-	defer removeFile(t, conf)
 	check(t, conf, "", 10, -1*time.Second)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: -1", `ttl: "-1s"`)))
-	defer removeFile(t, conf)
 	check(t, conf, "", -1, -1*time.Second)
 
 	// Check parsing errors
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "unknown_field: 123", "")))
-	defer removeFile(t, conf)
 	check(t, conf, "Unknown field", 0, 0)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 10", "ttl: 123")))
-	defer removeFile(t, conf)
 	check(t, conf, "not a duration string", 0, 0)
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(template, "max: 10", "ttl: xyz")))
-	defer removeFile(t, conf)
 	check(t, conf, "error parsing expires", 0, 0)
 }
 
@@ -2912,7 +2869,6 @@ func TestNoAuthUserCode(t *testing.T) {
 			]
 		}
 	`))
-	defer removeFile(t, confFileName)
 	defer os.Unsetenv("NO_AUTH_USER")
 
 	for _, user := range []string{"a", "b", "b"} {
@@ -2934,7 +2890,7 @@ func TestNoAuthUserCode(t *testing.T) {
 		})
 	}
 
-	for _, badUser := range []string{"notthere", "UBAAQWTW6CG2G6ANGNKB5U2B7HRWHSGMZEZX3AQSAJOQDAUGJD46LD2E"} {
+	for _, badUser := range []string{"notthere", "UBAAQWTW6CG2G6ANGNKB5U2B7HRWHSGMZEZX3AQSAJOQDAUGJD46LD2F"} {
 		t.Run(badUser, func(t *testing.T) {
 			os.Setenv("NO_AUTH_USER", badUser)
 			opts, err := ProcessConfigFile(confFileName)
@@ -2962,7 +2918,6 @@ const operatorJwtWithSysAccAndUrlResolver = `
 
 func TestReadOperatorJWT(t *testing.T) {
 	confFileName := createConfFile(t, []byte(operatorJwtWithSysAccAndUrlResolver))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received unexpected error %s", err)
@@ -2993,7 +2948,6 @@ func TestReadOperatorJWTSystemAccountMatch(t *testing.T) {
 	confFileName := createConfFile(t, []byte(operatorJwtWithSysAccAndMemResolver+`
 		system_account: ADSPOYMHXJN6JVYQCLRZ5XQ5IUN6A3S33XA4NV4VH74423U7U7YR4YVW
 	`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received unexpected error %s", err)
@@ -3009,7 +2963,6 @@ func TestReadOperatorJWTSystemAccountMismatch(t *testing.T) {
 	confFileName := createConfFile(t, []byte(operatorJwtWithSysAccAndMemResolver+`
 		system_account: ADXJJCDCSRSMCOV25FXQW7R4QOG7R763TVEXBNWJHLBMBGWOJYG5XZBG
 	`))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received unexpected error %s", err)
@@ -3036,7 +2989,6 @@ func TestReadOperatorAssertVersion(t *testing.T) {
 		operator: %s
 		resolver: MEM
 	`, jwt)))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received unexpected error %s", err)
@@ -3061,7 +3013,6 @@ func TestReadOperatorAssertVersionFail(t *testing.T) {
 		operator: %s
 		resolver: MEM
 	`, jwt)))
-	defer removeFile(t, confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received unexpected error %s", err)
@@ -3087,7 +3038,6 @@ func TestClusterNameAndGatewayNameConflict(t *testing.T) {
 			listen: 127.0.0.1:-1
 		}
 	`))
-	defer removeFile(t, conf)
 
 	opts, err := ProcessConfigFile(conf)
 	if err != nil {
@@ -3157,7 +3107,6 @@ func TestQueuePermissions(t *testing.T) {
 	} {
 		t.Run(test.permType+test.queue, func(t *testing.T) {
 			confFileName := createConfFile(t, []byte(fmt.Sprintf(cfgFmt, test.permType)))
-			defer removeFile(t, confFileName)
 			opts, err := ProcessConfigFile(confFileName)
 			if err != nil {
 				t.Fatalf("Received unexpected error %s", err)
@@ -3207,18 +3156,14 @@ func TestResolverPinnedAccountsFail(t *testing.T) {
 		resolver: URL(foo.bar)
 		resolver_pinned_accounts: [%s]
 	`
-	dirSrv := createDir(t, "srv")
-	defer removeDir(t, dirSrv)
 
 	conf := createConfFile(t, []byte(fmt.Sprintf(cfgFmt, ojwt, "f")))
-	defer removeFile(t, conf)
 	srv, err := NewServer(LoadConfig(conf))
 	defer srv.Shutdown()
 	require_Error(t, err)
 	require_Contains(t, err.Error(), " is not a valid public account nkey")
 
 	conf = createConfFile(t, []byte(fmt.Sprintf(cfgFmt, ojwt, "1, x")))
-	defer removeFile(t, conf)
 	_, err = ProcessConfigFile(conf)
 	require_Error(t, err)
 	require_Contains(t, "parsing resolver_pinned_accounts: unsupported type")
@@ -3229,7 +3174,6 @@ func TestMaxSubTokens(t *testing.T) {
 		listen: 127.0.0.1:-1
 		max_sub_tokens: 4
 	`))
-	defer removeFile(t, conf)
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
@@ -3351,7 +3295,6 @@ func TestAuthorizationAndAccountsMisconfigurations(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, []byte(test.config))
-			defer removeFile(t, conf)
 			if _, err := ProcessConfigFile(conf); err == nil || !strings.Contains(err.Error(), test.err) {
 				t.Fatalf("Expected error %q, got %q", test.err, err.Error())
 			}

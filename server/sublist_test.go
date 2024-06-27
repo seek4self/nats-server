@@ -1,4 +1,4 @@
-// Copyright 2016-2020 The NATS Authors
+// Copyright 2016-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 package server
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -28,8 +29,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// FIXME(dlc) - this is also used by monitor_test. Not needed with t.Helper.
-func stackFatalf(t *testing.T, f string, args ...interface{}) {
+func stackFatalf(t *testing.T, f string, args ...any) {
 	lines := make([]string, 0, 32)
 	msg := fmt.Sprintf(f, args...)
 	lines = append(lines, msg)
@@ -369,6 +369,30 @@ func TestSublistNoCacheRemoveBatch(t *testing.T) {
 	}
 }
 
+func TestSublistRemoveBatchWithError(t *testing.T) {
+	s := NewSublistNoCache()
+	sub1 := newSub("foo")
+	sub2 := newSub("bar")
+	sub3 := newSub("baz")
+	s.Insert(sub1)
+	s.Insert(sub2)
+	s.Insert(sub3)
+	subNotPresent := newSub("not.inserted")
+	// Try to remove all subs, but include the sub that has not been inserted.
+	err := s.RemoveBatch([]*subscription{subNotPresent, sub1, sub3})
+	// We expect an error to be returned, but sub1,2 and 3 to have been removed.
+	require_Error(t, err, ErrNotFound)
+	// Make sure that we have only sub2 present
+	verifyCount(s, 1, t)
+	r := s.Match("bar")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, sub2, t)
+	r = s.Match("foo")
+	verifyLen(r.psubs, 0, t)
+	r = s.Match("baz")
+	verifyLen(r.psubs, 0, t)
+}
+
 func testSublistInvalidSubjectsInsert(t *testing.T, s *Sublist) {
 	// Insert, or subscriptions, can have wildcards, but not empty tokens,
 	// and can not have a FWC that is not the terminal token.
@@ -551,6 +575,13 @@ func checkBool(b, expected bool, t *testing.T) {
 	}
 }
 
+func checkError(err, expected error, t *testing.T) {
+	t.Helper()
+	if err != expected && err != nil && !errors.Is(err, expected) {
+		t.Fatalf("Expected %v, but got %v\n", expected, err)
+	}
+}
+
 func TestSublistValidLiteralSubjects(t *testing.T) {
 	checkBool(IsValidLiteralSubject("foo"), true, t)
 	checkBool(IsValidLiteralSubject(".foo"), false, t)
@@ -578,7 +609,7 @@ func TestSublistValidLiteralSubjects(t *testing.T) {
 	checkBool(IsValidLiteralSubject(">bar"), true, t)
 }
 
-func TestSublistValidlSubjects(t *testing.T) {
+func TestSublistValidSubjects(t *testing.T) {
 	checkBool(IsValidSubject("."), false, t)
 	checkBool(IsValidSubject(".foo"), false, t)
 	checkBool(IsValidSubject("foo."), false, t)
@@ -645,6 +676,28 @@ func TestSubjectIsLiteral(t *testing.T) {
 	checkBool(subjectIsLiteral("foo.*.>"), false, t)
 	checkBool(subjectIsLiteral("foo.*.bar"), false, t)
 	checkBool(subjectIsLiteral("foo.bar.>"), false, t)
+}
+
+func TestValidateDestinationSubject(t *testing.T) {
+	checkError(ValidateMappingDestination("foo"), nil, t)
+	checkError(ValidateMappingDestination("foo.bar"), nil, t)
+	checkError(ValidateMappingDestination("*"), nil, t)
+	checkError(ValidateMappingDestination(">"), nil, t)
+	checkError(ValidateMappingDestination("foo.*"), nil, t)
+	checkError(ValidateMappingDestination("foo.>"), nil, t)
+	checkError(ValidateMappingDestination("foo.*.>"), nil, t)
+	checkError(ValidateMappingDestination("foo.*.bar"), nil, t)
+	checkError(ValidateMappingDestination("foo.bar.>"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{wildcard(1)}}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{ wildcard(1) }}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{wildcard( 1 )}}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{partition(2,1)}}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{SplitFromLeft(2,1)}}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{SplitFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMappingDestination("foo.{{unknown(1)}}"), ErrInvalidMappingDestination, t)
+	checkError(ValidateMappingDestination("foo..}"), ErrInvalidMappingDestination, t)
+	checkError(ValidateMappingDestination("foo. bar}"), ErrInvalidMappingDestinationSubject, t)
+
 }
 
 func TestSubjectToken(t *testing.T) {
@@ -1045,6 +1098,7 @@ func TestIsSubsetMatch(t *testing.T) {
 		test    string
 		result  bool
 	}{
+		{"foo.bar", "foo.bar", true},
 		{"foo.*", ">", true},
 		{"foo.*", "*.*", true},
 		{"foo.*", "foo.*", true},
@@ -1070,7 +1124,7 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	ch := make(chan bool, 1)
 
 	expectErr := func(subject string) {
-		if err := s.RegisterNotification("foo.*", ch); err != ErrInvalidSubject {
+		if err := s.RegisterNotification(subject, ch); err != ErrInvalidSubject {
 			t.Fatalf("Expected err, got %v", err)
 		}
 	}
@@ -1095,7 +1149,7 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	}
 
 	tt := time.NewTimer(time.Second)
-	expectBool := func(b bool) {
+	expectBoolWithCh := func(ch chan bool, b bool) {
 		t.Helper()
 		tt.Reset(time.Second)
 		defer tt.Stop()
@@ -1107,6 +1161,10 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 		case <-tt.C:
 			t.Fatalf("Timeout waiting for expected value")
 		}
+	}
+	expectBool := func(b bool) {
+		t.Helper()
+		expectBoolWithCh(ch, b)
 	}
 	expectFalse := func() {
 		t.Helper()
@@ -1122,11 +1180,15 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 			t.Fatalf("Expected no notifications, had %d and first was %v", lch, <-ch)
 		}
 	}
-	expectOne := func() {
+	expectOneWithCh := func(ch chan bool) {
 		t.Helper()
 		if len(ch) != 1 {
 			t.Fatalf("Expected 1 notification")
 		}
+	}
+	expectOne := func() {
+		t.Helper()
+		expectOneWithCh(ch)
 	}
 
 	expectOne()
@@ -1318,6 +1380,43 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 		t.Fatalf("Expected to return true")
 	}
 
+	if err := s.RegisterQueueNotification("some.subject", "queue1", ch); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expectOne()
+	expectFalse()
+
+	qsub1 = newQSub("some.subject", "queue1")
+	s.Insert(qsub1)
+	expectTrue()
+
+	// Create a second channel for this other queue
+	ch2 := make(chan bool, 1)
+	if err := s.RegisterQueueNotification("some.subject", "queue2", ch2); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expectOneWithCh(ch2)
+	expectBoolWithCh(ch2, false)
+
+	qsub2 = newQSub("some.subject", "queue2")
+	s.Insert(qsub2)
+	expectBoolWithCh(ch2, true)
+
+	// But we should not get notification on queue1
+	expectNone()
+
+	s.Remove(qsub1)
+	expectFalse()
+	s.Remove(qsub2)
+	expectBoolWithCh(ch2, false)
+
+	if !s.ClearQueueNotification("some.subject", "queue1", ch) {
+		t.Fatalf("Expected to return true")
+	}
+	if !s.ClearQueueNotification("some.subject", "queue2", ch2) {
+		t.Fatalf("Expected to return true")
+	}
+
 	// Test non-blocking notifications.
 	if err := s.RegisterNotification("bar", ch); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1402,6 +1501,20 @@ func TestSublistReverseMatch(t *testing.T) {
 	verifyMember(r.psubs, fooBarBazSub, t)
 }
 
+func TestSublistReverseMatchWider(t *testing.T) {
+	s := NewSublistWithCache()
+	sub := newSub("uplink.*.*.>")
+	s.Insert(sub)
+
+	r := s.ReverseMatch("uplink.1.*.*.>")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, sub, t)
+
+	r = s.ReverseMatch("uplink.1.2.3.>")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, sub, t)
+}
+
 func TestSublistMatchWithEmptyTokens(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -1428,6 +1541,39 @@ func TestSublistMatchWithEmptyTokens(t *testing.T) {
 	}
 }
 
+func TestSublistSubjectCollide(t *testing.T) {
+	require_False(t, SubjectsCollide("foo.*", "foo.*.bar.>"))
+	require_False(t, SubjectsCollide("foo.*.bar.>", "foo.*"))
+	require_True(t, SubjectsCollide("foo.*", "foo.foo"))
+	require_True(t, SubjectsCollide("foo.*", "*.foo"))
+	require_True(t, SubjectsCollide("foo.bar.>", "*.bar.foo"))
+}
+
+func TestSublistAddCacheHitRate(t *testing.T) {
+	sl1 := NewSublistWithCache()
+	fooSub := newSub("foo")
+	sl1.Insert(fooSub)
+	for i := 0; i < 4; i++ {
+		sl1.Match("foo")
+	}
+	stats1 := sl1.Stats()
+	require_True(t, stats1.CacheHitRate == 0.75)
+
+	sl2 := NewSublistWithCache()
+	barSub := newSub("bar")
+	sl2.Insert(barSub)
+	for i := 0; i < 4; i++ {
+		sl2.Match("bar")
+	}
+	stats2 := sl2.Stats()
+	require_True(t, stats2.CacheHitRate == 0.75)
+
+	ts := &SublistStats{}
+	ts.add(stats1)
+	ts.add(stats2)
+	require_True(t, ts.CacheHitRate == 0.75)
+}
+
 // -- Benchmarks Setup --
 
 var benchSublistSubs []*subscription
@@ -1435,6 +1581,8 @@ var benchSublistSl = NewSublistWithCache()
 
 // https://github.com/golang/go/issues/31859
 func TestMain(m *testing.M) {
+	flag.StringVar(&testDefaultClusterCompression, "cluster_compression", _EMPTY_, "Test with this compression level as the default")
+	flag.StringVar(&testDefaultLeafNodeCompression, "leafnode_compression", _EMPTY_, "Test with this compression level as the default")
 	flag.Parse()
 	initSublist := false
 	flag.Visit(func(f *flag.Flag) {
@@ -1452,6 +1600,172 @@ func TestMain(m *testing.M) {
 		addWildcards()
 	}
 	os.Exit(m.Run())
+}
+
+func TestSublistHasInterest(t *testing.T) {
+	sl := NewSublistWithCache()
+	fooSub := newSub("foo")
+	sl.Insert(fooSub)
+
+	// Expect to find that "foo" matches but "bar" doesn't.
+	// At this point nothing should be in the cache.
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("bar"))
+	require_Equal(t, sl.cacheHits, 0)
+
+	// Now call Match(), which will populate the cache.
+	sl.Match("foo")
+	require_Equal(t, sl.cacheHits, 0)
+
+	// Future calls to HasInterest() should hit the cache now.
+	for i := uint64(1); i <= 5; i++ {
+		require_True(t, sl.HasInterest("foo"))
+		require_Equal(t, sl.cacheHits, i)
+	}
+
+	// Call Match on a subject we know there is no match.
+	sl.Match("bar")
+	require_False(t, sl.HasInterest("bar"))
+
+	// Remove fooSub and check interest again
+	sl.Remove(fooSub)
+	require_False(t, sl.HasInterest("foo"))
+
+	// Try with some wildcards
+	sub := newSub("foo.*")
+	sl.Insert(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	// Remove sub, there should be no interest
+	sl.Remove(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	sub = newSub("foo.>")
+	sl.Insert(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.bar.baz"))
+
+	sl.Remove(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	sub = newSub("*.>")
+	sl.Insert(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.baz"))
+	sl.Remove(sub)
+
+	sub = newSub("*.bar")
+	sl.Insert(sub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.baz"))
+	sl.Remove(sub)
+
+	sub = newSub("*")
+	sl.Insert(sub)
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	sl.Remove(sub)
+
+	// Try with queues now.
+	qsub := newQSub("foo", "bar")
+	sl.Insert(qsub)
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+
+	qsub2 := newQSub("foo", "baz")
+	sl.Insert(qsub2)
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+
+	// Remove first queue
+	sl.Remove(qsub)
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+
+	// Remove last.
+	sl.Remove(qsub2)
+	require_False(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+
+	// With wildcards now
+	qsub = newQSub("foo.*", "bar")
+	sl.Insert(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	// Add another queue to the group
+	qsub2 = newQSub("foo.*", "baz")
+	sl.Insert(qsub2)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	// Remove first queue
+	sl.Remove(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	// Remove last
+	sl.Remove(qsub2)
+	require_False(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	qsub = newQSub("foo.>", "bar")
+	sl.Insert(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.bar.baz"))
+
+	// Add another queue to the group
+	qsub2 = newQSub("foo.>", "baz")
+	sl.Insert(qsub2)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.bar.baz"))
+
+	// Remove first queue
+	sl.Remove(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.bar.baz"))
+
+	// Remove last
+	sl.Remove(qsub2)
+	require_False(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.bar.baz"))
+
+	qsub = newQSub("*.>", "bar")
+	sl.Insert(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_True(t, sl.HasInterest("foo.baz"))
+	sl.Remove(qsub)
+
+	qsub = newQSub("*.bar", "bar")
+	sl.Insert(qsub)
+	require_False(t, sl.HasInterest("foo"))
+	require_True(t, sl.HasInterest("foo.bar"))
+	require_False(t, sl.HasInterest("foo.baz"))
+	sl.Remove(qsub)
+
+	qsub = newQSub("*", "bar")
+	sl.Insert(qsub)
+	require_True(t, sl.HasInterest("foo"))
+	require_False(t, sl.HasInterest("foo.bar"))
+	sl.Remove(qsub)
 }
 
 func subsInit(pre string, toks []string) {

@@ -27,7 +27,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
+func checkFor(t testing.TB, totalWait, sleepDur time.Duration, f func() error) {
 	t.Helper()
 	timeout := time.Now().Add(totalWait)
 	var err error
@@ -131,25 +131,25 @@ type dummyLogger struct {
 	msg string
 }
 
-func (d *dummyLogger) Fatalf(format string, args ...interface{}) {
+func (d *dummyLogger) Fatalf(format string, args ...any) {
 	d.Lock()
 	d.msg = fmt.Sprintf(format, args...)
 	d.Unlock()
 }
 
-func (d *dummyLogger) Errorf(format string, args ...interface{}) {
+func (d *dummyLogger) Errorf(format string, args ...any) {
 }
 
-func (d *dummyLogger) Debugf(format string, args ...interface{}) {
+func (d *dummyLogger) Debugf(format string, args ...any) {
 }
 
-func (d *dummyLogger) Tracef(format string, args ...interface{}) {
+func (d *dummyLogger) Tracef(format string, args ...any) {
 }
 
-func (d *dummyLogger) Noticef(format string, args ...interface{}) {
+func (d *dummyLogger) Noticef(format string, args ...any) {
 }
 
-func (d *dummyLogger) Warnf(format string, args ...interface{}) {
+func (d *dummyLogger) Warnf(format string, args ...any) {
 }
 
 func TestStackFatal(t *testing.T) {
