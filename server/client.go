@@ -272,6 +272,10 @@ type client struct {
 	nameTag string
 
 	tlsTo *time.Timer
+
+	// sthg begin 用于主题详情埋点
+	subjMsgsCount
+	// sthg end
 }
 
 type rrTracking struct {
@@ -520,6 +524,11 @@ type subscription struct {
 	qw      int32
 	closed  int32
 	mqtt    *mqttSub
+
+	// sthg begin
+	msgCount
+	deliver []byte
+	// sthg end
 }
 
 // Indicate that this subscription is closed.
@@ -592,6 +601,10 @@ func (c *client) initClient() {
 
 	c.subs = make(map[string]*subscription)
 	c.echo = true
+
+	// sthg begin
+	c.subjMsgsCount.init()
+	// sthg end
 
 	c.setTraceLevel()
 
@@ -2341,6 +2354,11 @@ func (c *client) processPub(arg []byte) error {
 	if c.pa.size < 0 {
 		return fmt.Errorf("processPub Bad or Missing Size: '%s'", arg)
 	}
+
+	// sthg begin  Add pub埋点，同时对当前连接的主题进行了统计计数
+	c.setConnKind(conKindPub)
+	// sthg end
+
 	maxPayload := atomic.LoadInt32(&c.mpay)
 	// Use int64() to avoid int32 overrun...
 	if maxPayload != jwt.NoLimit && int64(c.pa.size) > int64(maxPayload) {
@@ -2399,6 +2417,11 @@ func (c *client) parseSub(argo []byte, noForward bool) error {
 	default:
 		return fmt.Errorf("processSub Parse Error: '%s'", arg)
 	}
+
+	// sthg begin
+	c.setConnKind(conKindSub)
+	// sthg end
+
 	// If there was an error, it has been sent to the client. We don't return an
 	// error here to not close the connection as a parsing error.
 	c.processSub(subject, queue, sid, nil, noForward)
@@ -2417,6 +2440,10 @@ func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForw
 
 	// Indicate activity.
 	c.in.subs++
+
+	// sthg begin: stat counsumer
+	c.statConsumer(sub.subject)
+	// sthg end
 
 	// Grab connection type, account and server info.
 	kind := c.kind
@@ -3223,6 +3250,10 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 		}
 	}
 
+	// sthg begin 在这里进行埋点
+	client.statSubMsg(sub, msg)
+	// sthg end
+
 	// Queue to outbound buffer
 	client.queueOutbound(mh)
 	client.queueOutbound(msg)
@@ -3514,6 +3545,10 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	// The msg includes the CR_LF, so pull back out for accounting.
 	c.in.msgs++
 	c.in.bytes += int32(len(msg) - LEN_CR_LF)
+
+	//sthg begin
+	c.statPubMsg()
+	//sthg end
 
 	// Check that client (could be here with SYSTEM) is not publishing on reserved "$GNR" prefix.
 	if c.kind == CLIENT && hasGWRoutedReplyPrefix(c.pa.subject) {
@@ -4163,6 +4198,12 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 			dsubj = subject
 		}
 
+		//sthg begin
+		if checkInbox(subject) && len(deliver) > 0 {
+			sub.deliver = deliver
+		}
+		//sthg end
+
 		// Normal delivery
 		mh := c.msgHeader(dsubj, creply, sub)
 		didDeliver = c.deliverMsg(sub, acc, dsubj, creply, mh, msg, rplyHasGWPrefix) || didDeliver
@@ -4707,6 +4748,11 @@ func (c *client) closeConnection(reason ClosedState) {
 		c.mu.Unlock()
 		return
 	}
+
+	//sthg begin
+	c.cleanPubSub()
+	//sthg end
+
 	// Note that we may have markConnAsClosed() invoked before closeConnection(),
 	// so don't set this to 1, instead bump the count.
 	c.rref++

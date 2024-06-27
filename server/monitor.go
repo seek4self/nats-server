@@ -1367,6 +1367,11 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 		s.basePath(LeafzPath),
 		s.basePath(GatewayzPath),
 		s.basePath(HealthzPath),
+		// sthg begin update root html
+		s.basePath(SummzPath),
+		s.basePath(SubClientszPath),
+		s.basePath(SubListzPath),
+		// sthg end
 	)
 }
 

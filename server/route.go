@@ -437,6 +437,12 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 		return
 	}
 
+	// sthg begin handleDeliverSubject
+	if ok := c.handleDeliverSubject(r, acc, msg); ok {
+		return
+	}
+	// sthg end
+
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
 	if len(r.psubs)+len(r.qsubs) > 0 {

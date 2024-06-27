@@ -107,6 +107,10 @@ type Info struct {
 
 // Server is our main struct.
 type Server struct {
+	// sthg begin
+	summaryStats
+	// sthg end
+
 	// Fields accessed with atomic operations need to be 64-bit aligned
 	gcid uint64
 	// How often user logon fails due to the issuer account not being pinned.
@@ -422,6 +426,10 @@ func NewServer(opts *Options) (*Server, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// sthg begin
+	s.initSummary()
+	// sthg end
 
 	// Place ourselves in the JetStream nodeInfo if needed.
 	if opts.JetStream {
@@ -1347,6 +1355,10 @@ func (s *Server) setAccountSublist(acc *Account) {
 		} else {
 			acc.sl = NewSublistWithCache()
 		}
+
+		// sthg begin
+		acc.sl.setAccountFlag(acc.Name)
+		// sthg end
 	}
 }
 
@@ -2359,6 +2371,10 @@ func (s *Server) startMonitoring(secure bool) error {
 	mux.HandleFunc(s.basePath(HealthzPath), s.HandleHealthz)
 	// IPQueuesz
 	mux.HandleFunc(s.basePath(IPQueuesPath), s.HandleIPQueuesz)
+
+	// sthg begin
+	s.customHandler(mux)
+	// sthg end
 
 	// Do not set a WriteTimeout because it could cause cURL/browser
 	// to return empty response or unable to display page if the

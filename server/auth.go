@@ -333,6 +333,25 @@ func (s *Server) checkAuthentication(c *client) bool {
 func (s *Server) isClientAuthorized(c *client) bool {
 	opts := s.getOpts()
 
+	// sthg bengin
+	var userName = c.opts.Username
+	if opts.CustomClientAuthentication != nil && !strings.HasPrefix(userName, "user_") {
+		if opts.CustomClientAuthentication.Check(c) {
+			if _, ok := s.users[userName]; !ok {
+				//如果没有查找到合适的，则查找default user 是否存在
+				if _, dok := s.users["user_isbp_default"]; !dok {
+					return false
+				} else {
+					c.opts.Username = "user_isbp_default"
+					c.opts.Password = "isbp_*&^%$#@!"
+				}
+			}
+		} else {
+			return false
+		}
+	}
+	//sthg end
+
 	// Check custom auth first, then jwts, then nkeys, then
 	// multiple users with TLS map if enabled, then token,
 	// then single user/pass.

@@ -72,6 +72,10 @@ type Sublist struct {
 	ccSweep   int32
 	notify    *notifyMaps
 	count     uint32
+
+	// sthg begin
+	subjCount
+	// sthg end
 }
 
 // notifyMaps holds maps of arrays of channels for notifications
@@ -412,6 +416,11 @@ func (s *Sublist) Insert(sub *subscription) error {
 		}
 		l = n.next
 	}
+
+	// sthg begin
+	s.subjCount.add(sub.subject, n, 1)
+	// sthg end
+
 	if sub.queue == nil {
 		n.psubs[sub] = sub
 		isnew = len(n.psubs) == 1
@@ -795,6 +804,10 @@ func (s *Sublist) remove(sub *subscription, shouldLock bool, doCacheUpdates bool
 	if s.notify != nil && last && !haswc && len(s.notify.remove) > 0 {
 		s.chkForRemoveNotification(subject, string(sub.queue))
 	}
+
+	// sthg begin
+	s.subjCount.add(sub.subject, n, -1)
+	// sthg end
 
 	return nil
 }

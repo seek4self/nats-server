@@ -2577,6 +2577,11 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		// We reuse the subscription object that we pass to deliverMsg.
 		// So set/reset important fields.
 		sub.nm, sub.max = 0, 0
+
+		// sthg begin
+		sub.msgCount.clean()
+		// sthg end
+
 		sub.client = gwc
 		sub.subject = subject
 		didDeliver = c.deliverMsg(sub, acc, subject, mreply, mh, msg, false) || didDeliver
@@ -3096,7 +3101,7 @@ func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName string) {
 // If `client` is nil, the mapping is stored in the client's account's gwReplyMapping
 // structure. Account lock will be explicitly acquired.
 // This is a server receiver because we use a timer interval that is avail in
-/// Server.gateway object.
+// / Server.gateway object.
 func (s *Server) trackGWReply(c *client, acc *Account, reply, routedReply []byte) {
 	var l sync.Locker
 	var g *gwReplyMapping
