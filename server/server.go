@@ -47,7 +47,7 @@ import (
 	"github.com/nats-io/nkeys"
 	"github.com/nats-io/nuid"
 
-	"github.com/nats-io/nats-server/v2/logger"
+	"github.com/nats-io/nats-server/me-v2/logger"
 )
 
 const (

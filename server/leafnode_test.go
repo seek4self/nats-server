@@ -37,7 +37,7 @@ import (
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 
-	"github.com/nats-io/nats-server/v2/internal/testhelper"
+	"github.com/nats-io/nats-server/me-v2/internal/testhelper"
 )
 
 type captureLeafNodeRandomIPLogger struct {
